@@ -5,7 +5,7 @@ import datetime
 # --- 1. 초기 설정값 및 상수 ---
 
 # [사용자 설정] 원-핫 인코딩 실행 여부 (True 또는 False)
-ONE_HOT_ENCODING = True  # True로 설정 시, 열 순서를 논리적으로 재배치함
+ONE_HOT_ENCODING = False  # True로 설정 시, 열 순서를 논리적으로 재배치함
 
 INPUT_FILE_PATH = "./data/train/train.csv"
 OUTPUT_DIR = "./data/final_train_datasets"
@@ -23,6 +23,7 @@ HOLIDAYS = [
     pd.to_datetime("2023-05-01").date(),
     pd.to_datetime("2023-05-05").date(),
     pd.to_datetime("2023-05-27").date(),
+    pd.to_datetime("2023-05-29").date(),
     pd.to_datetime("2023-06-06").date(),
     pd.to_datetime("2023-08-15").date(),
     pd.to_datetime("2023-09-28").date(),
@@ -38,7 +39,7 @@ HOLIDAYS = [
     pd.to_datetime("2024-02-11").date(),
     pd.to_datetime("2024-02-12").date(),
     pd.to_datetime("2024-03-01").date(),
-    pd.to_datetime("2024-04-19").date(),
+    pd.to_datetime("2024-04-10").date(),
     pd.to_datetime("2024-05-01").date(),
     pd.to_datetime("2024-05-05").date(),
     pd.to_datetime("2024-05-06").date(),
