@@ -8,8 +8,8 @@ from sklearn.preprocessing import LabelEncoder
 import glob
 from tqdm import tqdm
 import warnings
-import optuna # Optuna 라이브러리 임포트
-from sklearn.metrics import mean_absolute_error # 성능 평가를 위한 MAE
+import optuna
+from sklearn.metrics import mean_absolute_error
 
 warnings.filterwarnings('ignore')
 
@@ -41,7 +41,6 @@ print(f"Train 데이터 로드 완료, Test 파일 {len(test_files)}개 로드 �
 # 2. 피처 엔지니어링 함수 정의
 # ==============================================================================
 def create_base_features(df):
-    # ... (이전과 동일)
     df[['영업장명', '메뉴명']] = df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
     df['영업일자'] = pd.to_datetime(df['영업일자'])
     df['요일'] = df['영업일자'].dt.dayofweek
@@ -53,6 +52,12 @@ def create_base_features(df):
     df['하루뒤_날짜'] = df['영업일자'] + pd.to_timedelta(1, unit='D')
     df['휴일전날여부'] = df['하루뒤_날짜'].apply(lambda x: 1 if (x in custom_holidays or x.dayofweek >= 5) else 0)
     df.drop(columns=['하루뒤_날짜'], inplace=True)
+    def get_season(month):
+        if month in [4, 5, 6]: return '봄'
+        elif month in [7, 8]: return '여름'
+        elif month in [9, 10, 11]: return '가을'
+        else: return '겨울'
+    df['계절'] = df['월'].apply(get_season)
     return df
 
 print("피처 엔지니어링 함수 정의 완료.")
@@ -61,22 +66,22 @@ print("피처 엔지니어링 함수 정의 완료.")
 # 3. 학습 데이터 생성 (Sliding Window 방식)
 # ==============================================================================
 print("학습 데이터를 Sliding Window 방식으로 생성합니다... (시간이 소요될 수 있습니다)")
+# (이하 학습 데이터 생성 로직은 이전과 동일)
 train_df_processed = create_base_features(train_df)
 train_df_processed = train_df_processed.sort_values(by=['영업장명_메뉴명', '영업일자'])
-
 encoders = {}
 categorical_features = ['영업장명', '메뉴명']
 for feature in categorical_features:
     le = LabelEncoder()
     train_df_processed[feature] = le.fit_transform(train_df_processed[feature])
     encoders[feature] = le
-train_df_processed = pd.get_dummies(train_df_processed, columns=['요일'], prefix='요일')
-encoders['요일_columns'] = [col for col in train_df_processed.columns if col.startswith('요일_')]
+train_df_processed = pd.get_dummies(train_df_processed, columns=['요일', '계절'], prefix=['요일', '계절'])
+ohe_columns = [col for col in train_df_processed.columns if col.startswith('요일_') or col.startswith('계절_')]
+encoders['ohe_columns'] = ohe_columns
 
 training_samples = []
 for item_id, group in tqdm(train_df_processed.groupby('영업장명_메뉴명'), desc="학습 샘플 생성 중"):
-    if len(group) < 28 + 7:
-        continue
+    if len(group) < 28 + 7: continue
     for i in range(len(group) - 28 - 7 + 1):
         input_window = group.iloc[i : i+28]
         target_window = group.iloc[i+28 : i+28+7]
@@ -87,12 +92,9 @@ for item_id, group in tqdm(train_df_processed.groupby('영업장명_메뉴명'),
             features[f'rolling_std_{window}'] = input_window['매출수량'].rolling(window, min_periods=1).std().iloc[-1]
         lags = [7, 14, 21, 28]
         for lag in lags:
-            if len(input_window) >= lag:
-                features[f'lag_{lag}'] = input_window['매출수량'].iloc[-lag]
-            else:
-                features[f'lag_{lag}'] = np.nan
-        for day in range(1, 8):
-            features[f'target_d{day}'] = target_window['매출수량'].iloc[day-1]
+            if len(input_window) >= lag: features[f'lag_{lag}'] = input_window['매출수량'].iloc[-lag]
+            else: features[f'lag_{lag}'] = np.nan
+        for day in range(1, 8): features[f'target_d{day}'] = target_window['매출수량'].iloc[day-1]
         training_samples.append(features)
 
 final_train_df = pd.concat(training_samples, ignore_index=True)
@@ -106,42 +108,43 @@ for feature, max_val in cyclical_features.items():
 print("학습 데이터 생성 완료.")
 
 # ==============================================================================
-# 3.5. 하이퍼파라미터 튜닝 (Optuna)
+# 3.5. 하이퍼파라미터 개별 튜닝 (Optuna)
 # ==============================================================================
-print("Optuna를 사용하여 하이퍼파라미터 튜닝을 시작합니다...")
+print("Optuna를 사용하여 모델별 하이퍼파라미터 튜닝을 시작합니다... (시간이 매우 오래 소요됩니다)")
 
-# 튜닝을 위한 학습/검증 데이터 분리 (시간 기반)
+# 튜닝용 학습/검증 데이터 분리
 validation_cutoff_date = final_train_df['영업일자'].max() - pd.to_timedelta(28, unit='D')
 tune_train_df = final_train_df[final_train_df['영업일자'] <= validation_cutoff_date]
 tune_val_df = final_train_df[final_train_df['영업일자'] > validation_cutoff_date]
 
-# Optuna가 최적화할 목적 함수(objective) 정의
-def objective(trial):
+# Optuna 목적 함수
+def objective(trial, target_day):
+    # 공통 피처 목록
     base_features = [
         '영업장명', '메뉴명', '휴일여부', '휴일전날여부',
         '월_sin', '월_cos', '연중일자_sin', '연중일자_cos'
-    ] + encoders['요일_columns']
+    ] + ohe_columns
     rolling_features = [f'rolling_mean_{w}' for w in [7, 14, 21, 28]] + [f'rolling_std_{w}' for w in [7, 14, 21, 28]]
     lag_features = [f'lag_{l}' for l in [7, 14, 21, 28]]
     current_features = base_features + rolling_features + lag_features
-
-    # 튜닝할 하이퍼파라미터들의 탐색 범위를 지정
+    
+    # 튜닝할 하이퍼파라미터 범위
     params = {
         'objective': 'regression_l1', 'metric': 'mae',
-        'n_estimators': trial.suggest_int('n_estimators', 500, 3000, step=100),
+        'n_estimators': trial.suggest_int('n_estimators', 500, 2000, step=100),
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'max_depth': trial.suggest_int('max_depth', 4, 10),
         'num_leaves': trial.suggest_int('num_leaves', 20, 100),
-        'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
-        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
-        'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 1.0),
+        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
+        'bagging_freq': 1,
         'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
         'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
         'verbose': -1, 'n_jobs': -1, 'seed': 42
     }
     
-    # 대표 모델(7일 뒤 예측)을 기준으로 튜닝
-    target_col = 'target_d7'
+    # 현재 튜닝할 타겟
+    target_col = f'target_d{target_day}'
     X_train_tune = tune_train_df[current_features]
     y_train_tune = tune_train_df[target_col]
     X_val_tune = tune_val_df[current_features]
@@ -156,27 +159,28 @@ def objective(trial):
     mae = mean_absolute_error(y_val_tune, preds)
     return mae
 
-# Optuna 스터디 생성 및 최적화 실행
-study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=50)
+# 7개 모델 각각에 대한 최적 파라미터를 저장할 딕셔너리
+best_params_per_model = {}
 
-print('Best trial number:', study.best_trial.number)
-print('Best value (MAE):', study.best_value)
-print('Best trial params:', study.best_trial.params)
+# 7개 모델을 순회하며 각각 튜닝 실행
+for i in range(1, 8):
+    print(f"\n--- D+{i}일 예측 모델 튜닝 시작 ---")
+    study = optuna.create_study(direction='minimize')
+    # lambda 함수를 사용하여 objective 함수에 현재 튜닝할 모델의 인덱스(i)를 전달
+    study.optimize(lambda trial: objective(trial, i), n_trials=30) # n_trials를 줄여서 테스트 (e.g., 30)
+    
+    best_params = study.best_trial.params
+    best_params_per_model[f'd{i}'] = best_params
+    print(f"--- D+{i}일 모델 최적 파라미터 탐색 완료 ---")
+    print(f"  Best MAE: {study.best_value}")
+    print(f"  Best Params: {best_params}")
 
-# 최적의 파라미터를 저장
-best_params = study.best_trial.params
 
 # ==============================================================================
-# 4. 모델 7개 학습 (최적화된 파라미터 사용)
+# 4. 모델 7개 학습 (개별 최적화된 파라미터 사용)
 # ==============================================================================
-print("최적화된 파라미터로 최종 모델 7개 학습을 시작합니다...")
-final_params = {
-    'objective': 'regression_l1', 'metric': 'mae', 
-    'verbose': -1, 'n_jobs': -1, 'seed': 42
-}
-final_params.update(best_params)
-
+print("\n개별 최적화된 파라미터로 최종 모델 7개 학습을 시작합니다...")
+# (이하 학습 및 추론 로직은 이전과 거의 동일하나, 각 모델에 맞는 파라미터를 적용하는 부분만 다름)
 weights_map = {
     '미라시아': 7.71, '담하': 6.51, '연회장': 3.48, '라그로타': 3.44,
     '느티나무 셀프BBQ': 2.78, '화담숲주막': 1.43, '카페테리아': 1.31,
@@ -188,7 +192,7 @@ final_train_df['sample_weight'] = final_train_df['영업장명'].map(encoded_to_
 base_features = [
     '영업장명', '메뉴명', '휴일여부', '휴일전날여부',
     '월_sin', '월_cos', '연중일자_sin', '연중일자_cos'
-] + encoders['요일_columns']
+] + ohe_columns
 rolling_features = [f'rolling_mean_{w}' for w in [7, 14, 21, 28]] + [f'rolling_std_{w}' for w in [7, 14, 21, 28]]
 lag_features = [f'lag_{l}' for l in [7, 14, 21, 28]]
 current_features = base_features + rolling_features + lag_features
@@ -201,6 +205,15 @@ models = {}
 for i in tqdm(range(1, 8), desc="최종 모델 학습 진행"):
     y_train = final_train_df[f'target_d{i}']
     
+    # 현재 모델(d{i})에 맞는 최적 파라미터를 가져옴
+    current_best_params = best_params_per_model[f'd{i}']
+    
+    final_params = {
+        'objective': 'regression_l1', 'metric': 'mae', 
+        'verbose': -1, 'n_jobs': -1, 'seed': 42
+    }
+    final_params.update(current_best_params)
+
     model = lgb.LGBMRegressor(**final_params)
     model.fit(X_train, y_train, sample_weight=sample_weight)
     
@@ -212,6 +225,7 @@ print("모델 7개 학습 완료.")
 # 5. 추론 및 제출 파일 생성
 # ==============================================================================
 print("추론 및 제출 파일 생성을 시작합니다...")
+# (이하 추론 로직은 이전과 동일)
 all_preds = []
 
 for test_file in tqdm(test_files, desc="Test 파일별 추론 진행"):
@@ -231,8 +245,8 @@ for test_file in tqdm(test_files, desc="Test 파일별 추론 진행"):
     for feature in ['영업장명', '메뉴명']:
         pred_input_df_base[feature] = pred_input_df_base[feature].apply(lambda x: encoders[feature].transform([x])[0] if x in encoders[feature].classes_ else -1)
     
-    pred_input_df_base = pd.get_dummies(pred_input_df_base, columns=['요일'], prefix='요일')
-    for col in encoders['요일_columns']:
+    pred_input_df_base = pd.get_dummies(pred_input_df_base, columns=['요일', '계절'], prefix=['요일', '계절'])
+    for col in ohe_columns:
         if col not in pred_input_df_base.columns:
             pred_input_df_base[col] = 0
             
@@ -266,5 +280,5 @@ submission_df = final_submission_df.pivot(index='영업일자', columns='영업�
 submission_df['영업일자'] = submission_df['영업일자'].dt.strftime('%Y-%m-%d')
 submission_df = submission_df.reindex(columns=submission_template.columns, fill_value=0)
 
-submission_df.to_csv('./data/LightGBM_model7_custom_weights_optuna_submission.csv', index=False)
-print("LightGBM_model7_custom_weights_optuna_submission.csv 파일 생성이 완료되었습니다.")
+submission_df.to_csv('./data/lightGBM_model7_weight_season_add_optuna_submission.csv', index=False)
+print("lightGBM_model7_weight_season_add_optuna_submission.csv 파일 생성이 완료되었습니다.")
