@@ -271,7 +271,7 @@ for test_file in tqdm(test_files, desc="Test 파일별 추론 진행"):
         temp_df = pd.DataFrame({
             '영업일자': pred_date,
             '영업장명_메뉴명': original_item_names,
-            '매출수량': np.round(predictions)
+            '매출수량': np.round(predictions).astype(int)
         })
         all_preds.append(temp_df)
 
