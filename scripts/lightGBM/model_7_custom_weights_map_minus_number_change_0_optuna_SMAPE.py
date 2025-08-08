@@ -276,7 +276,7 @@ print("추론 및 제출 파일 생성을 시작합니다...")
 # (이하 추론 로직은 이전과 동일)
 all_preds = []
 
-for test_file in tqdm(test_files, desc="Test 파일별 추론 진행"):
+for test_idx, test_file in enumerate(tqdm(test_files, desc="Test 파일별 추론 진행")):
     test_df = pd.read_csv(test_file)
     history_df = create_base_features(test_df.copy())
     history_df = history_df.sort_values(by=['영업장명_메뉴명', '영업일자'])
@@ -294,7 +294,7 @@ for test_file in tqdm(test_files, desc="Test 파일별 추론 진행"):
         pred_input_df_base[feature] = pred_input_df_base[feature].apply(lambda x: encoders[feature].transform([x])[0] if x in encoders[feature].classes_ else -1)
     
     pred_input_df_base = pd.get_dummies(pred_input_df_base, columns=['요일', '계절'], prefix=['요일', '계절'])
-    for col in ohe_columns:
+    for col in encoders['ohe_columns']:
         if col not in pred_input_df_base.columns:
             pred_input_df_base[col] = 0
             
@@ -308,24 +308,30 @@ for test_file in tqdm(test_files, desc="Test 파일별 추론 진행"):
         pred_input_df_base = pd.merge(pred_input_df_base, lag_data, on='영업장명_메뉴명', how='left')
 
     X_test = pred_input_df_base[current_features]
-    last_date = pd.to_datetime(test_df['영업일자'].max())
     
     for i in range(1, 8):
         model = models[f'model_d{i}']
         predictions = model.predict(X_test)
         predictions[predictions < 0] = 0
 
-        pred_date = last_date + pd.to_timedelta(i, unit='D')
+        # **[수정]** 제출 형식에 맞게 '영업일자'를 문자열로 생성합니다.
+        # f-string을 사용하여 'TEST_00+1일', 'TEST_01+7일' 과 같은 형식을 만듭니다.
+        pred_date_str = f"TEST_{test_idx:02d}+{i}일"
+        
         temp_df = pd.DataFrame({
-            '영업일자': pred_date,
+            '영업일자': pred_date_str, # 문자열 ID를 사용
             '영업장명_메뉴명': original_item_names,
             '매출수량': np.round(predictions).astype(int)
         })
         all_preds.append(temp_df)
 
+# 모든 예측 결과를 하나로 합칩니다.
 final_submission_df = pd.concat(all_preds, ignore_index=True)
+# pivot을 사용하여 제출 형식으로 변환합니다.
 submission_df = final_submission_df.pivot(index='영업일자', columns='영업장명_메뉴명', values='매출수량').reset_index()
-submission_df['영업일자'] = submission_df['영업일자'].dt.strftime('%Y-%m-%d')
+# **[수정]** 날짜 변환 코드를 제거합니다. (이미 올바른 문자열 형식이므로)
+# submission_df['영업일자'] = submission_df['영업일자'].dt.strftime('%Y-%m-%d')
+# 샘플 제출 파일과 컬럼 순서를 맞춥니다.
 submission_df = submission_df.reindex(columns=submission_template.columns, fill_value=0)
 
 submission_df.to_csv('./data/lightGBM_model7_weight_season_add_optuna_SMAPE_submission.csv', index=False)
