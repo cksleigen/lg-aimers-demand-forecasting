@@ -1,0 +1,21 @@
+{
+  "n_hidden": 512,
+  "n_blocks": 2,
+  "n_dropout": 0.09633208794129916,
+  "emb_store": 48,
+  "use_menu": false,
+  "n_cond": 128,
+  "t_channels": 256,
+  "t_levels": 3,
+  "t_kernel": 5,
+  "t_dropout": 0.14761412739096127,
+  "t_emb_store": 32,
+  "t_use_menu": true,
+  "t_emb_menu": 16,
+  "t_cond": 32,
+  "lambda_pos": 0.19998808410540156,
+  "blend_alpha": 0.43512791425412073,
+  "lr": 0.001499350467459821,
+  "wd": 3.702678391250746e-06,
+  "batch_size": 2048
+}
