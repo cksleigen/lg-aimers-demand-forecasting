@@ -128,7 +128,7 @@ def run_menu_visualization_eda(train_csv_path: str):
 
 # 메인 실행
 if __name__ == '__main__':
-    run_menu_visualization_eda('/content/drive/MyDrive/data/train/train.csv')
+    run_menu_visualization_eda('./data/train/train.csv')
 
 """##TCN"""
 
