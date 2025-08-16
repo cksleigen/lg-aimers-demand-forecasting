@@ -190,5 +190,49 @@
     "현미뻥스크림": 175,
     "황태해장국": 176
   },
-  "blend_alpha": 0.43512791425412073
+  "cat2id": {
+    "alcohol": 1,
+    "bbq": 2,
+    "coffee": 3,
+    "dessert_drink": 4,
+    "hot_food": 5,
+    "noodles": 6,
+    "others": 7,
+    "rice": 8
+  },
+  "type2id": {
+    "casual": 1,
+    "event": 2,
+    "fine_dining": 3,
+    "outdoor": 4,
+    "specialty": 5,
+    "traditional": 6
+  },
+  "blend_alpha": 0.6259735585314823,
+  "chan_keys_order": [
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+    "week_sin",
+    "week_cos",
+    "quarter_sin",
+    "quarter_cos",
+    "is_fri",
+    "is_sat",
+    "is_sun",
+    "is_weekend",
+    "is_hol",
+    "is_before_hol",
+    "is_after_hol",
+    "is_mstart",
+    "is_mend",
+    "is_spring",
+    "is_summer",
+    "is_autumn",
+    "is_winter",
+    "is_vac_summer",
+    "is_vac_winter"
+  ],
+  "amp_dtype": "bf16"
 }
