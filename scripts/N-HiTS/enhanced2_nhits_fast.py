@@ -97,7 +97,7 @@ class EnhancedNHiTSConfig:
     train_csv: str = "./data/train/train.csv"
     test_glob: str = "./data/test/*.csv"
     submission_template_csv: str = "./data/sample_submission.csv"
-    out_submission_csv: str = "./data/enhanced2_nhits_submission_epochs150.csv"
+    out_submission_csv: str = "./data/enhanced2_nhits_submission_epochs120.csv"
 
     date_col: str = "영업일자"
     item_col: str = "영업장명_메뉴명"
@@ -111,7 +111,7 @@ class EnhancedNHiTSConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     log1p: bool = True
 
-    EPOCHS_FULL: int = 150
+    EPOCHS_FULL: int = 120
     BATCH_FULL: int = 1024
     BASE_LR_FULL: float = 1e-3
     MAX_LR_FULL: float = 2.5e-3
