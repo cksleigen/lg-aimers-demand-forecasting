@@ -65,11 +65,11 @@ class EnhancedNHiTSConfig:
     log1p: bool = True
 
     # 공용 학습 하이퍼파라미터(풀 학습)
-    EPOCHS_FULL: int = 150
-    BATCH_FULL: int = 512
-    BASE_LR_FULL: float = 8e-4
-    MAX_LR_FULL: float = 2e-3
-    WD_FULL: float = 3e-4
+    EPOCHS_FULL: int = 100
+    BATCH_FULL: int = 256
+    BASE_LR_FULL: float = 6e-4
+    MAX_LR_FULL: float = 1.5e-3
+    WD_FULL: float = 6e-4
 
     # 튜닝 (옵션)
     USE_OPTUNA: bool = False
@@ -86,13 +86,13 @@ class EnhancedNHiTSConfig:
     persistent_workers: bool = False  # 메모리 안전 우선
 
     # N-HiTS 구조
-    hidden: int = 512
+    hidden: int = 384
     n_blocks: int = 3
-    n_layers: int = 2
+    n_layers: int = 1
     n_pool_kernel_size: Optional[List[int]] = None
     pooling_mode: str = "MaxPool1d"
     interpolation_mode: str = "linear"
-    dropout: float = 0.1
+    dropout: float = 0.22
     stack_types: Optional[List[str]] = None
     n_freq_downsample: Optional[List[int]] = None
 
@@ -111,20 +111,20 @@ class EnhancedNHiTSConfig:
     custom_holidays_list: Optional[List[str]] = None
 
     # ==== PatchTST ====
-    ptst_d_model: int = 256
+    ptst_d_model: int = 192
     ptst_nhead: int = 8
     ptst_num_layers: int = 2
-    ptst_patch_len: int = 4
-    ptst_stride: int = 4
-    ptst_dropout: float = 0.1
+    ptst_patch_len: int = 3
+    ptst_stride: int = 2
+    ptst_dropout: float = 0.2
     ptst_head_hidden: int = 256
-    ptst_ff_mult: float = 2.0  # Config화
+    ptst_ff_mult: float = 1.5  # Config화
 
     # ==== TimesNet ====
     tnet_channels: int = 128
     tnet_blocks: int = 3
     tnet_kernels: Tuple[int, int, int] = (3, 5, 7)
-    tnet_dropout: float = 0.1
+    tnet_dropout: float = 0.12
     tnet_head_hidden: int = 256
 
     # ==== GRU ====
@@ -139,7 +139,7 @@ class EnhancedNHiTSConfig:
 
     # ==== 훈련 보조 ====
     grad_clip: float = 0.5
-    earlystop_patience_ratio: float = 0.2
+    earlystop_patience_ratio: float = 0.12
     earlystop_patience_min: int = 8
 
 
@@ -948,6 +948,133 @@ class ImprovedDLinearTiny(nn.Module):
         prob_logits = self.prob_head(prob_feat)
 
         return value_pred, prob_logits
+class SeasonalNaiveModel(nn.Module):
+    """
+    SeasonalNaive 모델: 주기적 패턴 기반 예측
+    - 주별 계절성(7일): 작주 같은 요일 값 사용
+    - 월별 패턴: 지난달 같은 시기 값 활용
+    - 트렌드 보정: 최근 변화율 반영
+    - 메타데이터 통합: 공휴일, 매장 특성 등 고려
+    """
+    def __init__(self, cfg: EnhancedNHiTSConfig, in_len: int, out_len: int,
+                 cal_dim: int, n_stores: int, n_categories: int, n_types: int):
+        super().__init__()
+        self.in_len = in_len
+        self.out_len = out_len
+        
+        # 메타 임베딩 (다른 모델과 동일)
+        self.store_emb = nn.Embedding(n_stores, 64)
+        self.cat_emb = nn.Embedding(n_categories, 32)
+        self.type_emb = nn.Embedding(n_types, 16)
+        self.cal_proj = nn.Linear(cal_dim, 128)
+        
+        # SeasonalNaive 특화 파라미터 (학습 가능한 보정 계수)
+        meta_dim = 64 + 32 + 16 + 128
+        
+        # 계절성 가중치 (주별/월별)
+        self.seasonal_weights = nn.Parameter(torch.tensor([0.7, 0.3]))  # [weekly, monthly]
+        
+        # 트렌드 보정 계수
+        self.trend_correction = nn.Sequential(
+            nn.Linear(meta_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, out_len)
+        )
+        
+        # 공휴일/특수일 보정
+        self.holiday_correction = nn.Sequential(
+            nn.Linear(meta_dim + cal_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, out_len)
+        )
+        
+        # 확률 예측 헤드 (다른 모델과 통일)
+        self.prob_head = nn.Sequential(
+            nn.Linear(meta_dim + 3, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, out_len)
+        )
+
+    def forward(self, x, past_cal, fut_cal, store_idx, cat_idx, type_idx):
+        B, L = x.shape
+        
+        # 메타 특성 임베딩
+        store_emb = self.store_emb(store_idx)
+        cat_emb = self.cat_emb(cat_idx)
+        type_emb = self.type_emb(type_idx)
+        cal_all = torch.cat([past_cal, fut_cal], dim=1).mean(dim=1)
+        cal_emb = self.cal_proj(cal_all)
+        meta_feat = torch.cat([store_emb, cat_emb, type_emb, cal_emb], dim=-1)
+        
+        # SeasonalNaive 핵심 로직
+        seasonal_preds = []
+        
+        # 1) 주별 계절성 (7일 주기)
+        if L >= 7:
+            weekly_vals = []
+            for i in range(self.out_len):
+                # 7일 전, 14일 전, 21일 전... 의 평균
+                lookback_positions = []
+                for week_back in [1, 2, 3, 4]:  # 최대 4주 전까지
+                    pos = L - (7 * week_back) + (i % 7)
+                    if 0 <= pos < L:
+                        lookback_positions.append(pos)
+                
+                if lookback_positions:
+                    # 최근일수록 높은 가중치
+                    weights = torch.softmax(torch.arange(len(lookback_positions), 0, -1, 
+                                          device=x.device, dtype=x.dtype), dim=0)
+                    weekly_val = sum(w * x[:, pos] for w, pos in zip(weights, lookback_positions))
+                else:
+                    weekly_val = x[:, -1]  # fallback
+                weekly_vals.append(weekly_val)
+            weekly_pred = torch.stack(weekly_vals, dim=1)  # [B, out_len]
+        else:
+            weekly_pred = x[:, -1:].repeat(1, self.out_len)
+        
+        # 2) 월별 계절성 (28일 주기, 대략 한달)
+        if L >= 28:
+            monthly_vals = []
+            for i in range(self.out_len):
+                # 28일 전 같은 위치
+                pos = L - 28 + i
+                if 0 <= pos < L:
+                    monthly_val = x[:, pos]
+                else:
+                    monthly_val = x[:, -1]
+                monthly_vals.append(monthly_val)
+            monthly_pred = torch.stack(monthly_vals, dim=1)
+        else:
+            monthly_pred = x[:, -1:].repeat(1, self.out_len)
+        
+        # 3) 가중 결합
+        weights = torch.softmax(self.seasonal_weights, dim=0)
+        base_pred = weights[0] * weekly_pred + weights[1] * monthly_pred
+        
+        # 4) 트렌드 보정 (최근 변화율 반영)
+        if L >= 3:
+            recent_trend = (x[:, -1] - x[:, -3]) / 2  # 최근 3일 평균 변화율
+            trend_effect = self.trend_correction(meta_feat)
+            trend_adjustment = recent_trend.unsqueeze(1) * trend_effect
+        else:
+            trend_adjustment = torch.zeros_like(base_pred)
+        
+        # 5) 공휴일/특수일 보정
+        fut_cal_flat = fut_cal.mean(dim=1)  # 미래 캘린더 평균
+        holiday_input = torch.cat([meta_feat, fut_cal_flat], dim=-1)
+        holiday_adjustment = self.holiday_correction(holiday_input)
+        
+        # 최종 예측값
+        value_pred = base_pred + 0.1 * trend_adjustment + 0.05 * holiday_adjustment
+        value_pred = torch.clamp(value_pred, min=0.0)  # 음수 방지
+        
+        # 확률 예측 (0/양수 분류)
+        x_stats = torch.stack([x.mean(dim=1), x.std(dim=1), x.max(dim=1)[0]], dim=1)
+        prob_input = torch.cat([meta_feat, x_stats], dim=-1)
+        prob_logits = self.prob_head(prob_input)
+        
+        return value_pred, prob_logits
 
 # =====================
 # Loss / EMA
@@ -1284,6 +1411,10 @@ def build_model_by_name(name: str, cfg: EnhancedNHiTSConfig, ds: EnhancedNHiTSDa
         dl_cfg = EnhancedNHiTSConfig(**{**cfg.__dict__, "dlin_head_hidden": head_h})
         return ImprovedDLinearTiny(dl_cfg, cfg.in_len, cfg.out_len, ds.cal_feats.shape[1], ds.n_stores, ds.n_categories, ds.n_types)
 
+    if name == "SeasonalNaive":
+        return SeasonalNaiveModel(cfg, cfg.in_len, cfg.out_len, ds.cal_feats.shape[1], 
+                                ds.n_stores, ds.n_categories, ds.n_types)
+
     raise ValueError(f"Unknown model name: {name}")
 
 def optuna_objective_factory(model_name: str, cfg: EnhancedNHiTSConfig, ds: EnhancedNHiTSDataset, mask_val: np.ndarray):
@@ -1389,7 +1520,7 @@ if __name__ == "__main__":
                 json.dump(best_params_all, f, ensure_ascii=False, indent=2)
 
     # ===== 모델 학습 (멀티 폴드 평균 val) =====
-    model_names = ["TimesNet", "GRU", "DLinear","N-HiTS","PatchTST"]
+    model_names = ["SeasonalNaive", "TimesNet", "GRU", "DLinear","N-HiTS", "PatchTST"]
     trained_models: Dict[str, nn.Module] = {}
     avg_val_losses: Dict[str, float] = {}
 
