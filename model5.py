@@ -44,8 +44,8 @@ warnings.filterwarnings('ignore')
 @dataclass
 class EnhancedNHiTSConfig:
     # 경로
-    train_csv: str = "LG_train.csv"
-    test_glob: str = "test/*.csv"
+    train_csv: str = "/content/drive/MyDrive/LG_train.csv"
+    test_glob: str = "/content/drive/MyDrive/test/*.csv"
     submission_template_csv: str = "sample_submission.csv"
     out_submission_csv: str = "0814_enhanced_5model_submission.csv"
 
