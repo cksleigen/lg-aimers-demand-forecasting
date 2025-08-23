@@ -8,12 +8,12 @@ Enhanced N-HiTS + Improved PatchTST + Improved TimesNet + GRU + MLinear (5-Model
 - 그룹별 선형 변환 + 메타 피처 통합
 - Hurdle 모델 지원
 """
+from __future__ import annotations
 
 import os, gc, glob, json, math, random, warnings
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -51,14 +51,9 @@ class EnhancedNHiTSConfig:
     train_csv: str = "LG_train.csv"
     test_glob: str = "test/*.csv"
     submission_template_csv: str = "sample_submission.csv"
-    out_submission_csv: str = "LG_output/0822_dohyun_TCN_submission.csv"
-    checkpoint_dir: str = "checkpoint2/0822_0.495_clu_ratio_4f_checkpoints"
-
-    # train_csv:str = "train_original.csv"
-    # test_glob:str = "test/*.csv"
-    # submission_template_csv:str = "sample_submission.csv
-    # out_submission_csv: str = "0820_submission.csv"
-
+    out_submission_csv: str = "LG_output/V7_submission.csv"
+    checkpoint_dir: str = "checkpoint/V7_checkpoints"
+    
     # 컬럼명
     date_col: str = "영업일자"
     item_col: str = "영업장명_메뉴명"
@@ -454,18 +449,6 @@ def build_enhanced_features(dates: List[pd.Timestamp], holidays_set: set, store_
     df["is_winter"] = df["month"].isin([12, 1, 2, 3]).astype(int)
     df["is_summer_vacation"] = df["month"].isin([7, 8]).astype(int)
     df["is_winter_vacation"] = df["month"].isin([12, 1, 2]).astype(int)
-
-    # 🚨 정기 휴무일 피처를 날짜 기반으로 직접 생성
-    df['is_regular_holiday'] = 0
-    df.loc[((df['date'].dt.month.isin(range(2, 12))) & (df['date'].dt.year == 2023) & (df['dow'] == 0)) |
-           ((df['date'].dt.month.isin(range(3, 7))) & (df['date'].dt.year == 2024) & (df['dow'] == 0)) |
-           (df['date'].isin(['2023-03-01'])) |
-           (df['date'].isin(['2023-09-01', '2023-09-02', '2023-09-03']) & (df['dow'].isin([0, 1, 2]))) |
-           (df['date'].isin(['2024-03-01'])) |
-           ((df['date'] >= '2023-05-01') & (df['dow'].isin([0, 1, 2, 3]))) |
-           (df['date'].dt.month.isin([12, 1, 2, 3]) & df['date'].dt.year.isin([2023, 2024, 2025])) |
-           ((~df['date'].dt.month.isin([12, 1, 2, 3])) & (df['dow'] == 0)), 'is_regular_holiday'] = 1
-
     df[["month_sin", "month_cos"]] = df["month"].apply(lambda m: pd.Series(sine_cosine_encoding(m, 12)))
     df[["dow_sin", "dow_cos"]] = df["dow"].apply(lambda d: pd.Series(sine_cosine_encoding(d, 7)))
     df[["doy_sin", "doy_cos"]] = df["date"].apply(lambda d: pd.Series(sine_cosine_encoding(d.dayofyear, 365)))
@@ -489,6 +472,14 @@ def make_val_mask_by_week(dataset: 'EnhancedNHiTSDataset', end_date_str: str) ->
 # ------------------------------
 # utils
 # ------------------------------
+def compute_weekend_ratio_per_item(df: pd.DataFrame, date_col: str, item_col: str, target_col: str, fallback: float = 1.0) -> pd.DataFrame:
+    # 아이템별로 안전한 주말/평일 비(주말 평균 / 평일 평균)를 계산
+    out = []
+    for it, g in df[[date_col, item_col, target_col]].dropna(subset=[item_col]).groupby(item_col):
+        r = get_weekend_sales_ratio_safe(g[[date_col, target_col]], date_col=date_col, target_col=target_col, fallback=fallback)
+        out.append((it, float(r)))
+    return pd.DataFrame(out, columns=[item_col, "weekend_sales_ratio"])
+
 def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     x = x - np.max(x, axis=axis, keepdims=True)
     e = np.exp(x)
@@ -763,9 +754,14 @@ class EnhancedNHiTSDataset(Dataset):
         self.df[cfg.target_col] = self.df[cfg.target_col].fillna(0)
 
         # 🚨 (추가) 주말 상대적 판매량 피처를 계산하여 병합
-        weekend_ratio_df = get_weekend_sales_ratio(self.df[[cfg.date_col, cfg.item_col, cfg.target_col]].dropna())
+        weekend_ratio_df = compute_weekend_ratio_per_item(self.df, date_col=cfg.date_col, item_col=cfg.item_col, target_col=cfg.target_col, fallback=1.0)
         self.df = pd.merge(self.df, weekend_ratio_df, on=cfg.item_col, how='left')
         self.df['weekend_sales_ratio'].fillna(1.0, inplace=True) # 없는 경우 1.0으로 채움 (패턴 없음)
+
+        # 🚨 (수정) 정기 휴무일 피처를 계산하여 병합
+        regular_holiday_df = create_regular_holiday_features(self.df)
+        self.df = pd.merge(self.df, regular_holiday_df[['영업일자', '영업장명_메뉴명', 'is_regular_holiday']], on=['영업일자', '영업장명_메뉴명'], how='left')
+        self.df['is_regular_holiday'].fillna(0, inplace=True)
 
         pivot = self.df.pivot(index=cfg.date_col, columns=cfg.item_col, values=cfg.target_col).sort_index()
         self.items = list(pivot.columns)
@@ -776,6 +772,10 @@ class EnhancedNHiTSDataset(Dataset):
 
         # 🚨 build_enhanced_features 함수 호출
         caldf = build_enhanced_features(self.dates, holidays_set)
+
+        # 🚨 (수정) is_regular_holiday 피처를 가져와서 캘린더 피처에 통합
+        pivot_regular_holiday = self.df.pivot(index=cfg.date_col, columns=cfg.item_col, values='is_regular_holiday').sort_index().mean(axis=1)
+        caldf['is_regular_holiday'] = pivot_regular_holiday.values
 
         self.cal_feats = caldf.drop(columns=["date"]).values.astype(np.float32)
         self.cal_feat_names = [c for c in caldf.columns if c != "date"]
@@ -804,10 +804,10 @@ class EnhancedNHiTSDataset(Dataset):
 
         # 🚨 (추가) 주말 상대적 판매량 피처를 배열로 저장
         self.item_weekend_ratio = self.df.drop_duplicates(subset=[cfg.item_col])\
-                                      .set_index(cfg.item_col)\
-                                      .loc[self.items, 'weekend_sales_ratio'].values.astype(np.float32)
+                                     .set_index(cfg.item_col)\
+                                     .loc[self.items, 'weekend_sales_ratio'].values.astype(np.float32)
 
-        sw = cfg.store_weights or DEFAULT_STORE_WEIGHTS
+        sw = cfg.store_weights or {}
         self.sample_weights = np.array([sw.get(parse_store_name(it), 1.0) for it in self.items], dtype=np.float32)
 
         self.indices: List[Tuple[int,int]] = []
@@ -858,11 +858,7 @@ class EnhancedNHiTSDataset(Dataset):
         pos_mask = (y > 0).astype(np.float32)
 
         zero_ratio = np.mean(x == 0)
-        try:
-            w_idx = self.cal_feat_names.index("is_weekend")
-            weekend_factor = float(past_cal[:, w_idx].mean())
-        except ValueError:
-            weekend_factor = 0.0  # fallback
+        weekend_factor = np.mean(past_cal[:, 12])
 
         return {
             "x": torch.from_numpy(x_in).float(),
@@ -879,7 +875,7 @@ class EnhancedNHiTSDataset(Dataset):
             "zero_ratio": torch.tensor(zero_ratio, dtype=torch.float32),
             "weekend_factor": torch.tensor(weekend_factor, dtype=torch.float32),
             "weekend_ratio": torch.tensor(weekend_ratio, dtype=torch.float32), # 🚨 새로운 피처 추가
-            "item_idx": torch.tensor(j, dtype=torch.long)}
+        }
 
 """### N-HiTS"""
 
@@ -2204,11 +2200,12 @@ def predict_one_file_generic(
     cfg: EnhancedNHiTSConfig,
     model: nn.Module,
     test_df: pd.DataFrame,
-    train_df: pd.DataFrame, # 🚨 (추가) train_df 인자 추가
+    train_df: pd.DataFrame,
     store2idx: Dict,
     cat2idx: Dict,
     type2idx: Dict,
-    group2idx: Dict = None
+    group2idx: Dict = None,
+    gamma: Optional[float] = None,
 ) -> pd.DataFrame:
     device = torch.device(cfg.device)
     if test_df is None or len(test_df) == 0:
@@ -2240,7 +2237,6 @@ def predict_one_file_generic(
     dates = list(pivot.index)
     values = pivot.values.astype(np.float32)
 
-    # replicate padding (훈련과 일관)
     Lx = cfg.in_len
     if len(dates) < Lx:
         pad_rows = Lx - len(dates)
@@ -2255,10 +2251,32 @@ def predict_one_file_generic(
     future_dates = [last_date + pd.Timedelta(days=i) for i in range(1, cfg.out_len + 1)]
     holidays_set = set(pd.to_datetime(cfg.custom_holidays_list)) if cfg.custom_holidays_list else set()
 
-    store_names = [parse_store_name(it) for it in items]
+    stores = [parse_store_name(it) for it in items]
 
-    past_cal = build_enhanced_features(dates[-Lx:], holidays_set, store_names).drop(columns=["date"]).values.astype(np.float32)
-    fut_cal = build_enhanced_features(future_dates, holidays_set, store_names).drop(columns=["date"]).values.astype(np.float32)
+    # 🚨 (수정) build_enhanced_features는 날짜 정보만 생성
+    past_cal_base = build_enhanced_features(dates[-Lx:], holidays_set)
+    fut_cal_base = build_enhanced_features(future_dates, holidays_set)
+
+    # 🚨 (추가) 정기 휴무일 피처를 생성 및 병합
+    all_df = pd.concat([train_df, tdf], axis=0)
+    regular_holiday_features = create_regular_holiday_features(all_df)
+    reg_hol_pivot = regular_holiday_features.pivot_table(index='영업일자', columns='영업장명_메뉴명', values='is_regular_holiday').fillna(0)
+
+    past_cal_expanded = past_cal_base.reindex(past_cal_base.index.repeat(len(items)))
+    past_cal_expanded['영업장명_메뉴명'] = list(items) * len(past_cal_base)
+
+    fut_cal_expanded = fut_cal_base.reindex(fut_cal_base.index.repeat(len(items)))
+    fut_cal_expanded['영업장명_메뉴명'] = list(items) * len(fut_cal_base)
+
+    past_cal_df = pd.merge(past_cal_expanded, regular_holiday_features[['영업일자', '영업장명_메뉴명', 'is_regular_holiday']],
+                           left_on=['date', '영업장명_메뉴명'], right_on=['영업일자', '영업장명_메뉴명'], how='left')
+    past_cal_df['is_regular_holiday'].fillna(0, inplace=True)
+    past_cal = past_cal_df.drop(columns=["date", "영업장명_메뉴명", "영업일자"]).values.astype(np.float32).reshape(len(items), Lx, -1)
+
+    fut_cal_df = pd.merge(fut_cal_expanded, regular_holiday_features[['영업일자', '영업장명_메뉴명', 'is_regular_holiday']],
+                          left_on=['date', '영업장명_메뉴명'], right_on=['영업일자', '영업장명_메뉴명'], how='left')
+    fut_cal_df['is_regular_holiday'].fillna(0, inplace=True)
+    fut_cal = fut_cal_df.drop(columns=["date", "영업장명_메뉴명", "영업일자"]).values.astype(np.float32).reshape(len(items), cfg.out_len, -1)
 
     x_np = values[-Lx:, :].T  # [B,L]
     if cfg.log1p:
@@ -2266,15 +2284,16 @@ def predict_one_file_generic(
 
     B = len(items)
     x = torch.from_numpy(x_np).to(device=device, dtype=torch.float32)
-    past_cal_b = torch.from_numpy(np.repeat(past_cal[None, :, :], B, axis=0)).to(device=device, dtype=torch.float32)
-    fut_cal_b = torch.from_numpy(np.repeat(fut_cal[None, :, :], B, axis=0)).to(device=device, dtype=torch.float32)
+
+    # 🚨 (수정) past_cal_b와 fut_cal_b를 올바른 형태로 변환
+    past_cal_b = torch.from_numpy(past_cal).to(device=device, dtype=torch.float32)
+    fut_cal_b = torch.from_numpy(fut_cal).to(device=device, dtype=torch.float32)
 
     stores = [parse_store_name(it) for it in items]
     menus = [parse_menu_name(it) for it in items]
 
     # 🚨 (추가) 주말 상대적 판매량 피처 계산 및 모델 입력으로 준비
-    all_df = pd.concat([train_df, tdf], axis=0)
-    weekend_ratio_df = get_weekend_sales_ratio(all_df)
+    weekend_ratio_df = compute_weekend_ratio_per_item(pd.concat([train_df, tdf], axis=0),date_col=cfg.date_col, item_col=cfg.item_col, target_col=cfg.target_col, fallback=1.0)
     weekend_ratio_map = weekend_ratio_df.set_index(cfg.item_col)['weekend_sales_ratio'].to_dict()
     weekend_ratio_np = np.array([weekend_ratio_map.get(it, 1.0) for it in items], dtype=np.float32)
     weekend_ratio_tensor = torch.from_numpy(weekend_ratio_np).to(device=device, dtype=torch.float32)
@@ -2287,20 +2306,15 @@ def predict_one_file_generic(
     cat_idx = torch.as_tensor([cat2idx.get(get_menu_category(m), safe_cat_default) for m in menus], device=device, dtype=torch.long)
     type_idx = torch.as_tensor([type2idx.get(get_store_type(s), safe_type_default) for s in stores], device=device, dtype=torch.long)
 
-    # MLinear용 그룹 정보
     if group2idx is not None:
         safe_group_default = next(iter(group2idx.values()), 0)
         group_idx = torch.as_tensor([group2idx.get(get_menu_group(s, m), safe_group_default)
                                      for s, m in zip(stores, menus)], device=device, dtype=torch.long)
-
-        # MLinear용 추가 피처
         zero_ratio = torch.tensor([np.mean(x_np[i] == 0) for i in range(B)], device=device, dtype=torch.float32)
-        cal_feat_names = [c for c in build_enhanced_features(dates[-Lx:], set()).columns if c != "date"]
-        try:
-            w_idx = cal_feat_names.index("is_weekend")
-            weekend_factor = torch.tensor([past_cal[:, w_idx].mean()] * B, device=device, dtype=torch.float32)
-        except ValueError:
-            weekend_factor = torch.zeros(B, device=device, dtype=torch.float32)
+
+        # 🚨 (수정) weekend_factor 계산 시 피처 인덱스 변경
+        weekend_factor_idx = past_cal_df.columns.get_loc('is_weekend')
+        weekend_factor = torch.tensor([past_cal[i, :, weekend_factor_idx].mean() for i in range(B)],device=device, dtype=torch.float32)
     else:
         group_idx = torch.zeros(B, device=device, dtype=torch.long)
         zero_ratio = torch.zeros(B, device=device, dtype=torch.float32)
@@ -2311,15 +2325,14 @@ def predict_one_file_generic(
 
     model.eval()
     with amp_ctx:
-        # 🚨 (수정) 모델에 weekend_ratio 전달
         v_pred_log, p_logits = model(x, past_cal_b, fut_cal_b, store_idx, cat_idx, type_idx,
                                      weekend_ratio=weekend_ratio_tensor,
                                      group_idx=group_idx, zero_ratio=zero_ratio, weekend_factor=weekend_factor)
         y_val = torch.expm1(v_pred_log).clamp_min(0.0)
         y_prob = torch.sigmoid(p_logits)
-        y_hat = (y_prob * y_val).clamp_min(0.0).detach().cpu().numpy()  # [B, out_len]
-        y_hat = dynamic_cap_floor_itemwise(y_hat, train_df=train_df, item_names=items, cfg=cfg, k_sigma=2.5, q_hi=0.98, min_floor=0.0, lookback_days=120
-    )
+        if gamma is not None: # γ 보정 적용 (클리핑 안전) 
+            y_prob = torch.clamp(gamma * y_prob, min=0.0, max=1.0)
+        y_hat = (y_prob * y_val).clamp_min(0.0).detach().cpu().numpy()
 
     out = pd.DataFrame(
         y_hat.T,
@@ -2328,6 +2341,8 @@ def predict_one_file_generic(
     )
     out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
     return out
+
+
 
 def dynamic_cap_floor_itemwise(y_hat: np.ndarray,
                                train_df: pd.DataFrame,
@@ -2365,6 +2380,45 @@ def dynamic_cap_floor_itemwise(y_hat: np.ndarray,
         clipped[i, :] = np.clip(clipped[i, :], min_floor, upper)
     return clipped
 
+def _safe_div(num: float, den: float, fallback: float = 0.0) -> float:
+    if den is None or den == 0 or not np.isfinite(den):
+        return float(fallback)
+    if num is None or not np.isfinite(num):
+        return float(fallback)
+    return float(num) / float(den)
+
+def get_weekend_sales_ratio_safe(df: pd.DataFrame, date_col: str, target_col: str, fallback: float = 0.0) -> float:
+    """
+    df[date_col]를 안전하게 파싱하고, 주말/평일 평균 매출비(주말/평일)를 반환.
+    - 날짜 파싱 실패(NaT)는 제외
+    - 분모(평일 평균)가 0/NaN이면 fallback 반환 (디폴트 0.0)
+    """
+    if date_col not in df.columns or target_col not in df.columns:
+        return float(fallback)
+
+    # 날짜 파싱 (실패시 NaT) → NaT는 제거
+    d = df[[date_col, target_col]].copy()
+    d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+    d = d.dropna(subset=[date_col])
+
+    if d.empty:
+        return float(fallback)
+
+    # 결측/비정상치 방어
+    vals = pd.to_numeric(d[target_col], errors="coerce")
+    d[target_col] = vals.fillna(0.0)
+
+    # 주말/평일 구분
+    dow = d[date_col].dt.dayofweek  # 0=월 … 5=토, 6=일
+    is_weekend = dow >= 5
+
+    wend_mean = d.loc[is_weekend, target_col].mean() if (is_weekend.any()) else np.nan
+    wkdy_mean = d.loc[~is_weekend, target_col].mean() if ((~is_weekend).any()) else np.nan
+
+    if not np.isfinite(wend_mean): wend_mean = 0.0
+    if not np.isfinite(wkdy_mean): wkdy_mean = 0.0
+
+    return _safe_div(wend_mean, wkdy_mean, fallback=fallback)
 
 def compute_dyn_weights_from_val(val_loss_dict: Dict[str, float], temperature: float = 1.5) -> Dict[str, float]:
     """
@@ -2592,41 +2646,65 @@ def cap_floor_itemwise(final_submit: pd.DataFrame, train_df: pd.DataFrame, cfg) 
         final_submit[col] = np.clip(final_submit[col].to_numpy(), floor_stat, cap)
     return final_submit
 
-"""### 메인 실행"""
+def _cfg_for_mlinear_ckpt(base_cfg):
+    return EnhancedNHiTSConfig(**{
+        **base_cfg.__dict__,
+        "mlin_hidden_dim": 512,        # ← ckpt 와 동일
+        "mlin_use_layer_norm": False,  # ← ckpt 에 LayerNorm 없음
+    })
+
+"""### 메인 실행 (v7, H-wise OFF)"""
 if __name__ == "__main__":
     cfg = EnhancedNHiTSConfig()
     if cfg.store_weights is None: cfg.store_weights = DEFAULT_STORE_WEIGHTS
     if cfg.custom_holidays_list is None: cfg.custom_holidays_list = DEFAULT_CUSTOM_HOLIDAYS
     set_seed(cfg.seed)
 
-    print("=== Enhanced 6-Model Ensemble (+ MLinear + TCN) 시작 ===")
+    print("=== v7: OOF 스태킹(전역가중) + p/바이어스 보정, H-wise OFF ===")
 
+    # ===== 데이터 로드 & 정합 =====
     if not os.path.exists(cfg.train_csv):
         raise FileNotFoundError(f"학습 파일을 찾을 수 없습니다: {cfg.train_csv}")
-
-    # train_df 먼저 로드 (predict에 사용)
     train_df = pd.read_csv(cfg.train_csv)
     ds = EnhancedNHiTSDataset(cfg, train_df)
 
-    # 체크포인트/아티팩트 디렉터리
+    if cfg.date_col in train_df.columns:
+        train_df[cfg.date_col] = pd.to_datetime(train_df[cfg.date_col], errors="coerce")
+        train_df = train_df.dropna(subset=[cfg.date_col])
+
+    for col in train_df.columns:
+        if col != cfg.date_col:
+            if train_df[col].dtype.kind in "biufc":
+                train_df[col] = pd.to_numeric(train_df[col], errors="coerce").fillna(0.0)
+            else:
+                train_df[col] = train_df[col].fillna("")
+    # 아티팩트/체크포인트 폴더
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    artifacts_dir = getattr(cfg, "artifacts_dir", "./artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
 
-    # ===== (옵션) Optuna per-model 튜닝 =====
+    # γ 보정 로딩
+    gamma = None
+    stacker_path = os.path.join(artifacts_dir, "oof_stacker.json")
+    if os.path.exists(stacker_path):
+        try:
+            stk = OOFStacker.load(stacker_path)
+            gamma = getattr(stk, "gamma", None)
+            print(f"[p-Calibration] gamma={gamma}")
+        except Exception as e:
+            print(f"[p-Calibration] 스태커 로드 실패: {e}")
+
+    # ===== (옵션) Optuna (MLinear만) =====
     best_params_all = {}
-    if cfg.USE_OPTUNA:
-        if not HAS_OPTUNA:
-            print("⚠️ cfg.USE_OPTUNA=True지만 optuna가 설치되어 있지 않습니다. 튜닝은 건너뜁니다.")
-        else:
-            print(f"[Optuna] 1st-fold({cfg.cv_fold_end_dates[0]})로 빠른 튜닝 실행")
-            tune_mask_val = make_val_mask_by_week(ds, cfg.cv_fold_end_dates[0])
-            for name in ["MLinear"]:
-                study, best_params = run_optuna_for_model(name, cfg, ds, tune_mask_val)
-                best_params_all[name] = best_params
-            os.makedirs("./data", exist_ok=True)
-            with open("./data/optuna_best_params.json", "w", encoding="utf-8") as f:
-                json.dump(best_params_all, f, ensure_ascii=False, indent=2)
+    if cfg.USE_OPTUNA and HAS_OPTUNA:
+        print(f"[Optuna] 1st-fold({cfg.cv_fold_end_dates[0]})로 빠른 튜닝 실행")
+        tune_mask_val = make_val_mask_by_week(ds, cfg.cv_fold_end_dates[0])
+        study, best_params = run_optuna_for_model("MLinear", cfg, ds, tune_mask_val)
+        best_params_all["MLinear"] = best_params
+        with open(os.path.join(artifacts_dir, "optuna_best_params.json"), "w", encoding="utf-8") as f:
+            json.dump(best_params_all, f, ensure_ascii=False, indent=2)
 
-    # 🚨 수동 주입: Optuna 결과가 없으면 아래 값 사용 (MLinear)
+    # Optuna 미사용/실패 시 기본 주입
     if ("MLinear" not in best_params_all) or (best_params_all["MLinear"] is None):
         best_params_all["MLinear"] = {
             "base_lr": 0.0005377,
@@ -2640,45 +2718,63 @@ if __name__ == "__main__":
             "ml_layer_norm": False,
         }
 
-    # ===== 1단계: OOF 생성(모든 모델 × 모든 폴드) → 스태커 학습 =====
+    # ===== 1단계: OOF 생성(모든 모델×폴드) → 전역가중/보정 학습 =====
     model_names = ["TCN", "MLinear", "TimesNet", "GRU", "N-HiTS", "PatchTST", "TSMixer"]
 
+    # 스태커 설정: H-wise 관련 옵션 없이(p/바이어스만 쓸 수 있게)
     stack_cfg = StackerConfig(
-        use_stacker=True, use_hwise_prior=True, prior_tau=1.2, prior_blend=0.5,
-        use_p_calib=True, use_recent_bias=True
+        use_stacker=True,
+        use_hwise_prior=False,        # ★ H-wise 완전 OFF
+        use_p_calib=True,             # p-보정 사용
+        use_recent_bias=True          # 최근 바이어스 보정 사용
     )
 
     OOF_y_true = []                                   # list of [N_fold, H]
-    OOF_yhat_by_model = {m: [] for m in model_names}  # per model: list of [N_fold, H]
+    OOF_yhat_by_model = {m: [] for m in model_names}  # m별 list of [N_fold, H]
     OOF_prob_mean = []                                # list of [N_fold, H]
-    OOF_item_names = []                               # aligned item names
+    OOF_item_names = []                               # 아이템 이름 정렬
 
-    # 재학습 단축용 플래그: OOF 최고의 fold 스냅샷 재활용
+    # 재학습 단축: OOF의 베스트 폴드 스냅샷 재사용해 최종 모델 구성
     REUSE_OOF_BEST = True
-
-    # ⬇️ OOF에서 수집해서 이후 그대로 사용(절대 재정의/덮어쓰기 금지)
-    saved_states = {m: [] for m in model_names}       # 각 모델별 fold의 state_dict
-    saved_val_losses = {m: [] for m in model_names}   # 각 모델별 fold의 val loss
-    hwise_losses_by_model = {m: [] for m in model_names}  # 각 모델별 fold의 [H] 손실
+    saved_states = {m: [] for m in model_names}
+    saved_val_losses = {m: [] for m in model_names}
 
     for f_idx, fold_end in enumerate(cfg.cv_fold_end_dates, start=1):
         print(f"\n=== [OOF] Fold {f_idx}/{len(cfg.cv_fold_end_dates)} | val_end={fold_end} ===")
         mask_val = make_val_mask_by_week(ds, fold_end)
-
         y_true_fold = None
         prob_accum = []
         item_idx_fold = None
 
         for mname in model_names:
-            model = build_model_by_name(mname, cfg, ds)
+            # 모델별 cfg 스위칭(MLinear만 Optuna 주입)
+            cfg_for_model = cfg
+            if mname == "MLinear":
+                bp = best_params_all["MLinear"]
+                cfg_for_model = EnhancedNHiTSConfig(**{
+                    **cfg.__dict__,
+                    "mlin_hidden_dim": bp.get("ml_hidden_dim", cfg.mlin_hidden_dim),
+                    "mlin_dropout": bp.get("ml_dropout", cfg.mlin_dropout),
+                    "mlin_use_residual": bp.get("ml_residual", cfg.mlin_use_residual),
+                    "mlin_use_layer_norm": bp.get("ml_layer_norm", cfg.mlin_use_layer_norm),
+                    "grad_clip": bp.get("grad_clip", cfg.grad_clip),
+                    "earlystop_patience_ratio": bp.get("pat_ratio", cfg.earlystop_patience_ratio),
+                })
+                base_lr = bp.get("base_lr", cfg.BASE_LR_FULL)
+                max_lr  = bp.get("max_lr",  cfg.MAX_LR_FULL)
+                weight_decay = bp.get("weight_decay", cfg.WD_FULL)
+            else:
+                base_lr, max_lr, weight_decay = cfg.BASE_LR_FULL, cfg.MAX_LR_FULL, cfg.WD_FULL
+
+            model = build_model_by_name(mname, cfg_for_model, ds)
             trainer = GenericTrainer(
-                cfg, ds, model,
-                epochs=cfg.EPOCHS_FULL, batch_size=cfg.BATCH_FULL,
-                base_lr=cfg.BASE_LR_FULL, max_lr=cfg.MAX_LR_FULL, weight_decay=cfg.WD_FULL
+                cfg_for_model, ds, model,
+                epochs=cfg_for_model.EPOCHS_FULL, batch_size=cfg_for_model.BATCH_FULL,
+                base_lr=base_lr, max_lr=max_lr, weight_decay=weight_decay
             )
             train_loader, val_loader = trainer.make_loaders_from_mask(mask_val)
 
-            # OOF용 학습
+            # OOF 학습
             model_f, val_loss = trainer.train_with_loaders(
                 train_loader, val_loader, model_name=f"{mname}-OOF-F{f_idx}"
             )
@@ -2686,13 +2782,6 @@ if __name__ == "__main__":
             # 스냅샷/val 저장
             saved_states[mname].append({k: v.cpu().clone() for k, v in model_f.state_dict().items()})
             saved_val_losses[mname].append(float(val_loss))
-
-            # H-wise 손실 수집(가벼움) → REUSE_OOF_BEST일 때도 H-wise 가중 가능
-            try:
-                h_loss = eval_hwise_smape(trainer, val_loader)  # [H]
-                hwise_losses_by_model[mname].append(h_loss)
-            except Exception as e:
-                print(f"[WARN] OOF h-wise 계산 실패({mname}-F{f_idx}): {e}")
 
             # OOF 예측 수집
             yt, yh, pp, idxs = trainer.predict_on_loader(val_loader)
@@ -2702,28 +2791,25 @@ if __name__ == "__main__":
             OOF_yhat_by_model[mname].append(yh)
             prob_accum.append(pp)
 
-            # 메모리 정리 (올바른 변수명)
+            # 메모리 정리
             del trainer, train_loader, val_loader, model_f, model
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-        # fold-level mean prob for p-calib
+        # fold-level prob 평균
         prob_mean = np.mean(np.stack(prob_accum, axis=0), axis=0)
         OOF_prob_mean.append(prob_mean)
         OOF_y_true.append(y_true_fold)
         names = [ds.items[i] if 0 <= i < len(ds.items) else f"item_{i}" for i in item_idx_fold]
         OOF_item_names.extend(names)
 
-    # concat over folds
-    yt_oof = np.concatenate(OOF_y_true, axis=0)                                   # [N_tot, H]
+    # OOF 병합
+    yt_oof = np.concatenate(OOF_y_true, axis=0)                                  # [N_tot, H]
     yh_oof = np.stack([np.concatenate(OOF_yhat_by_model[m], axis=0)
-                       for m in model_names], axis=1)                              # [N_tot, M, H]
-    p_oof_mean = np.concatenate(OOF_prob_mean, axis=0)                             # [N_tot, H]
+                       for m in model_names], axis=1)                             # [N_tot, M, H]
+    p_oof_mean = np.concatenate(OOF_prob_mean, axis=0)                            # [N_tot, H]
 
-    # 스태커 학습 & 저장
-    artifacts_dir = getattr(stack_cfg, "artifacts_dir", getattr(cfg, "artifacts_dir", "./artifacts"))
-    os.makedirs(artifacts_dir, exist_ok=True)
+    # 스태커(전역가중/보정 정보) 학습 & 저장
     stacker = OOFStacker(stack_cfg).fit(
         yh_oof, yt_oof, model_names=model_names,
         p_oof=p_oof_mean, item_names_oof=OOF_item_names
@@ -2732,147 +2818,51 @@ if __name__ == "__main__":
     stacker.save(stacker_path)
     print(f"[Stacker] saved to {stacker_path}")
 
-    # ===== 2단계: 최종 모델 구성 (REUSE_OOF_BEST=True면 재학습 스킵) =====
-    trained_models = {}
-    avg_val_losses = {}   # 전역 가중치 산출용
+    # ===== 2단계: 최종 모델 구성 (OOF 베스트 스냅샷 재사용) =====
+    trained_models, avg_val_losses = {}, {}
+    print("\n✅ REUSE_OOF_BEST=True: OOF 베스트 폴드 스냅샷으로 최종 모델 구성")
+    for name in model_names:
+        if len(saved_states[name]) == 0:
+            print(f"[WARN] {name}: 저장된 OOF 스냅샷 없음, 0번 사용")
+            best_idx = 0
+        else:
+            best_idx = int(np.argmin(saved_val_losses[name]))
+        best_state = saved_states[name][best_idx]
 
-    if REUSE_OOF_BEST:
-        print("\n✅ REUSE_OOF_BEST=True: OOF에서 가장 좋은 fold 스냅샷 재사용하여 최종 모델 구성")
-        for name in model_names:
-            if len(saved_states[name]) == 0:
-                print(f"[WARN] {name}: 저장된 OOF 스냅샷 없음, 임의 0번 사용")
-                best_idx = 0
-            else:
-                best_idx = int(np.argmin(saved_val_losses[name]))
-            best_state = saved_states[name][best_idx]
-
-            # ⬇️ OOF와 동일한 빌더로 생성해야 shape mismatch가 없음
+        # ⬇️ MLinear만 ckpt config 적용
+        if name == "MLinear":
+            cfg_mlin = _cfg_for_mlinear_ckpt(cfg)
+            final_model = build_model_by_name("MLinear", cfg_mlin, ds)
+        else:
             final_model = build_model_by_name(name, cfg, ds)
-            final_model.load_state_dict(best_state, strict=True)
-            trained_models[name] = final_model.to(cfg.device)
 
-            # 전역 가중치 집계를 위해 평균 val 저장
-            avg_val_losses[name] = float(np.mean(saved_val_losses[name])) if len(saved_val_losses[name]) else float('inf')
+        final_model.load_state_dict(best_state, strict=True)
+        trained_models[name] = final_model.to(cfg.device)
 
-            ckpt = os.path.join(cfg.checkpoint_dir, f"{name}_best_from_oof.pth")
-            torch.save(best_state, ckpt)
-            print(f"  💾 {name}: OOF 베스트 스냅샷 로드 & 저장 → {ckpt}")
-    else:
-        # (선택) REUSE_OOF_BEST=False 일 때만 폴드별 재학습 수행
-        for name in model_names:
-            checkpoint_path = os.path.join(cfg.checkpoint_dir, f"{name}_best_fold.pth")
-            print(f"\n📚 {name} 학습...")
+        avg_val_losses[name] = float(np.mean(saved_val_losses[name])) if len(saved_val_losses[name]) else float('inf')
 
-            # --- per-model 하이퍼/CFG ---
-            cfg_for_model = cfg
-            base_lr = cfg.BASE_LR_FULL; max_lr = cfg.MAX_LR_FULL; weight_decay = cfg.WD_FULL
-            best_for_model = best_params_all.get(name)
-            if name == "MLinear" and best_for_model is not None:
-                cfg_for_model = EnhancedNHiTSConfig(**{
-                    **cfg.__dict__,
-                    "mlin_hidden_dim": best_for_model.get("ml_hidden_dim", cfg.mlin_hidden_dim),
-                    "mlin_dropout": best_for_model.get("ml_dropout", cfg.mlin_dropout),
-                    "mlin_use_residual": best_for_model.get("ml_residual", cfg.mlin_use_residual),
-                    "mlin_use_layer_norm": best_for_model.get("ml_layer_norm", cfg.mlin_use_layer_norm),
-                    "grad_clip": best_for_model.get("grad_clip", cfg.grad_clip),
-                    "earlystop_patience_ratio": best_for_model.get("pat_ratio", cfg.earlystop_patience_ratio),
-                })
-                base_lr = best_for_model.get("base_lr", base_lr)
-                max_lr  = best_for_model.get("max_lr",  max_lr)
-                weight_decay = best_for_model.get("weight_decay", weight_decay)
+        ckpt = os.path.join(cfg.checkpoint_dir, f"{name}_best_from_oof.pth")
+        torch.save(best_state, ckpt)
+        print(f"  💾 {name}: OOF 베스트 스냅샷 저장 → {ckpt}")
 
-            # 초기 가중치 스냅샷
-            base_model = build_final_model_with_best(
-                name, cfg_for_model, ds, best_params_all.get(name) if (cfg.USE_OPTUNA or name == "MLinear") else None
-            )
-            init_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
-            del base_model
-            gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-            fold_vals = []
-            best_fold_state = None
-
-            for fold_i, end_date in enumerate(cfg.cv_fold_end_dates, start=1):
-                print(f"  └─ Fold {fold_i}/{len(cfg.cv_fold_end_dates)} | val_end={end_date}")
-                mask_val = make_val_mask_by_week(ds, end_date)
-
-                model_f = build_final_model_with_best(
-                    name, cfg_for_model, ds, best_params_all.get(name) if (cfg.USE_OPTUNA or name == "MLinear") else None
-                )
-                model_f.load_state_dict(init_state, strict=True)
-
-                trainer = GenericTrainer(
-                    cfg_for_model, ds, model_f,
-                    epochs=cfg_for_model.EPOCHS_FULL, batch_size=cfg_for_model.BATCH_FULL,
-                    base_lr=base_lr, max_lr=max_lr, weight_decay=weight_decay
-                )
-                train_loader, val_loader = trainer.make_loaders_from_mask(mask_val)
-                model_f, val_loss = trainer.train_with_loaders(train_loader, val_loader, model_name=f"{name}-F{fold_i}")
-                fold_vals.append(float(val_loss))
-
-                # horizon-wise sMAPE 수집
-                try:
-                    h_loss = eval_hwise_smape(trainer, val_loader)  # [H]
-                    hwise_losses_by_model[name].append(h_loss)
-                except Exception as e:
-                    print(f"[WARN] eval_hwise 실패({name}-F{fold_i}): {e}")
-
-                # 베스트 폴드 스냅샷
-                if (best_fold_state is None) or (val_loss < np.min(fold_vals[:-1] + [float('inf')])):
-                    best_fold_state = {k: v.detach().cpu().clone() for k, v in model_f.state_dict().items()}
-
-                # 메모리 정리
-                del trainer, train_loader, val_loader, model_f
-                gc.collect()
-                if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-            # 모델별 fold 평균 검증
-            avg_val = float(np.mean(fold_vals)) if len(fold_vals) > 0 else float('inf')
-            avg_val_losses[name] = avg_val
-            print(f"[VAL(avg over folds)] {name} = {avg_val:.5f}")
-
-            # 최종 모델: 베스트 폴드 파라미터 로드
-            final_model = build_final_model_with_best(
-                name, cfg_for_model, ds, best_params_all.get(name) if (cfg.USE_OPTUNA or name == "MLinear") else None
-            )
-            if best_fold_state is not None:
-                final_model.load_state_dict(best_fold_state, strict=True)
-                torch.save(best_fold_state, checkpoint_path)
-                print(f"  💾 베스트 폴드 체크포인트 저장: {checkpoint_path}")
-            trained_models[name] = final_model.to(cfg_for_model.device)
-
-    # ===== 3단계: H-wise + 전역 가중치 집계 =====
-    # 전역 가중치: 모델별 평균 val을 역수 정규화
-    def _norm(v):
-        v = np.array(v, dtype=np.float64)
-        v[~np.isfinite(v)] = np.nan
-        if np.all(np.isnan(v)):
-            return np.ones_like(v) / len(v)
-        v = np.nan_to_num(v, nan=np.nanmax(v) * 1.5)
-        z = 1.0 / np.clip(v, 1e-12, None)
-        if (not np.isfinite(z).any()) or (z.sum() <= 0):
-            return np.ones_like(z) / len(z)
-        return z / z.sum()
+    # ===== 3단계: 전역 가중치 집계(역손실, H-wise 없음) =====
+    def _norm_inverse_losses(loss_list, eps: float = 1e-6, winsor: float = 0.1):
+        a = np.array(loss_list, dtype=np.float64)
+        if a.size == 0: return a
+        a[~np.isfinite(a)] = np.nan
+        if np.all(np.isnan(a)): return np.ones_like(a) / len(a)
+        fill_val = np.nanmax(a) * 1.5
+        a = np.nan_to_num(a, nan=fill_val, posinf=fill_val, neginf=fill_val)
+        p_lo = np.nanpercentile(a, winsor*100.0); p_hi = np.nanpercentile(a, (1.0-winsor)*100.0)
+        if p_hi >= p_lo: a = np.clip(a, p_lo, p_hi)
+        inv = 1.0 / np.clip(a, eps, None)
+        s = inv.sum()
+        return inv / s if np.isfinite(s) and s > 0 else np.ones_like(inv) / len(inv)
 
     vals_in_order = [avg_val_losses.get(n, np.nan) for n in model_names]
-    w_global = _norm(vals_in_order)
+    w_global = _norm_inverse_losses(vals_in_order)
     weights = dict(zip(model_names, w_global))
     print("\n[Ensemble Global Weights] " + "  ".join([f"{k}={weights[k]:.3f}" for k in model_names]))
-
-    # H-wise 가중치: 각 모델에 대해 fold별 [H] 손실 평균 → 역수 정규화(합=1)
-    final_hwise = {}
-    for m in model_names:
-        if len(hwise_losses_by_model[m]) > 0:
-            arr = np.stack(hwise_losses_by_model[m], axis=0)  # [F, H]
-            hmean = np.mean(arr, axis=0)                      # [H]
-            hmean = np.clip(hmean, 1e-9, None)
-            wh = 1.0 / hmean
-            wh = wh / wh.sum()
-            final_hwise[m] = wh
-        else:
-            final_hwise[m] = np.ones(cfg.out_len, dtype=np.float64) / float(cfg.out_len)
-        print(f"[H-wise] {m}: {np.array2string(final_hwise[m], precision=3)}")
 
     # ===== 4단계: 추론 & 제출 =====
     print("\n🔮 앙상블 예측...")
@@ -2880,8 +2870,8 @@ if __name__ == "__main__":
     if not os.path.exists(cfg.submission_template_csv):
         raise FileNotFoundError(f"제출 템플릿 파일을 찾을 수 없습니다: {cfg.submission_template_csv}")
     sub_template = pd.read_csv(cfg.submission_template_csv)
-    all_preds = []
 
+    all_preds = []
     if len(test_files) == 0:
         print("⚠️ 테스트 파일이 없습니다. 제출 생성을 건너뜁니다.")
     else:
@@ -2893,75 +2883,80 @@ if __name__ == "__main__":
                 print(f"  ⚠️ 파일 로드 실패: {e}")
                 continue
 
-            # 모델별 예측 수집
+            if cfg.date_col in tdf.columns:
+                tdf[cfg.date_col] = pd.to_datetime(tdf[cfg.date_col], errors="coerce")
+                tdf = tdf.dropna(subset=[cfg.date_col])
+            for col in tdf.columns:
+                if col != cfg.date_col:
+                    if tdf[col].dtype.kind in "biufc":
+                        tdf[col] = pd.to_numeric(tdf[col], errors="coerce").fillna(0.0)
+                    else:
+                        tdf[col] = tdf[col].fillna("")
+
+            # 모델별 예측
             df_preds = {}
             for name in model_names:
                 group2idx = ds.group2idx if name == "MLinear" else None
                 df = predict_one_file_generic(
                     cfg, trained_models[name], tdf, train_df,
-                    ds.store2idx, ds.cat2idx, ds.type2idx, group2idx
+                    ds.store2idx, ds.cat2idx, ds.type2idx, group2idx, gamma=gamma
                 )
-                if df.empty:
-                    print(f"  ⚠️ {name} 예측이 비어 있습니다. 이 모델은 스킵합니다.")
+                if df is None or df.empty:
+                    print(f"  ⚠️ {name} 예측 비어 있음 → 스킵")
+                    continue
                 df_preds[name] = df
 
-            non_empty = [df for df in df_preds.values() if df is not None and not df.empty]
+            non_empty = [df for df in df_preds.values() if not df.empty]
             if len(non_empty) == 0:
-                print(f"  ⚠️ {test_file} 유효 예측이 없어 스킵합니다.")
+                print("  ⚠️ 유효 예측 없음 → 스킵")
                 continue
 
+            # 아이템 정렬 일치
             items = list(non_empty[0].columns)
             for k in df_preds:
-                if df_preds[k] is not None and not df_preds[k].empty:
-                    df_preds[k] = df_preds[k].reindex(columns=items).fillna(0.0)
+                df_preds[k] = df_preds[k].reindex(columns=items).fillna(0.0)
 
-            # === H-wise + 전역 가중 앙상블 ===
-            mix = np.zeros_like(non_empty[0].values, dtype=np.float64)   # [H, I]
-            for name in model_names:
-                df = df_preds.get(name, None)
-                if df is None or df.empty:
-                    continue
-                W_h = final_hwise.get(name, np.ones(cfg.out_len)/cfg.out_len).reshape(-1, 1)  # [H,1]
-                mix += weights[name] * (df.values * W_h)  # H-wise 재분배 후 글로벌 가중
+            # === 전역 가중치 앙상블 (H-wise 없음) ===
+            models_available = [n for n in model_names if n in df_preds]
+            if len(models_available) == 0:
+                print("  ⚠️ 사용 가능한 모델 예측이 없습니다. 스킵")
+                continue
 
-            # 1) 음수 클립
+            w = np.array([weights.get(n, 0.0) for n in models_available], dtype=np.float64)
+            w = w / w.sum() if w.sum() > 0 else np.ones(len(models_available))/len(models_available)
+
+            mix = np.zeros_like(df_preds[models_available[0]].values, dtype=np.float64)  # [H, I]
+            for i, n in enumerate(models_available):
+                mix += w[i] * df_preds[n].values
+
+            # 음수 클립
             mix = np.clip(mix, 0.0, None)
 
-            # 2) 최근 바이어스 보정 (아이템별 스칼라) — 앙상블 합산 후 적용
+            # (선택) 아이템 바이어스 보정
             if getattr(stacker, "bias_by_item", None) and stack_cfg.use_recent_bias:
-                bias_vec = np.array([stacker.bias_by_item.get(it, 0.0) for it in items], dtype=np.float64)  # [I]
-                mix = np.maximum(0.0, mix - bias_vec.reshape(1, -1))  # [H,I] - [1,I]
+                bias_vec = np.array([stacker.bias_by_item.get(it, 0.0) for it in items], dtype=np.float64)
+                mix = np.maximum(0.0, mix - bias_vec.reshape(1, -1))
 
-            submit_block = pd.DataFrame(
-                mix,
-                index=[f"D+{i}" for i in range(1, cfg.out_len + 1)],
-                columns=items
-            )
-
-            # 표기 & 스무딩
-            submit_block.index = [f"TEST_{test_idx:02d}+{k}일" for k in range(1, cfg.out_len + 1)]
-            submit_block = smooth_horizon_block(submit_block)
+            submit_block = pd.DataFrame(mix, index=[f"D+{i}" for i in range(1, cfg.out_len+1)], columns=items)
+            submit_block.index = [f"TEST_{test_idx:02d}+{k}일" for k in range(1, cfg.out_len+1)]
+            submit_block = smooth_horizon_block(submit_block)  # 필요 시 스무딩(총합보존)
             all_preds.append(submit_block)
 
-    # ===== 5단계: 제출 저장 =====
+    # ===== 5단계: 저장 =====
     if len(all_preds) == 0:
         print("⚠️ 유효한 예측 결과가 없어 제출 파일을 생성하지 않았습니다.")
     else:
-        final_submit = pd.concat(all_preds, axis=0)
-        final_submit.reset_index(inplace=True)
+        final_submit = pd.concat(all_preds, axis=0).reset_index()
         final_submit.rename(columns={"index": "영업일자"}, inplace=True)
-
         final_submit = final_submit.reindex(columns=sub_template.columns, fill_value=0)
 
         # 캡/플로어 + 정수화
         final_submit = cap_floor_itemwise(final_submit, train_df, cfg)
         num_cols = [c for c in final_submit.columns if c != cfg.date_col]
-        final_submit[num_cols] = np.rint(
-            np.clip(final_submit[num_cols].values, a_min=0, a_max=None)
-        ).astype(int)
+        final_submit[num_cols] = np.rint(np.clip(final_submit[num_cols].values, 0, None)).astype(int)
 
         os.makedirs(os.path.dirname(cfg.out_submission_csv), exist_ok=True)
         final_submit.to_csv(cfg.out_submission_csv, index=False, encoding="utf-8-sig")
         print(f"✅ 앙상블 완료! → {cfg.out_submission_csv}")
 
-    print("\n🏆 TimesNet + GRU + MLinear + N-HiTS + PatchTST + TSMixer + TCN 학습/추론 끝")
+    print("\n🏁 v7(H-wise OFF) 완료: TimesNet + GRU + MLinear + N-HiTS + PatchTST + TSMixer + TCN")
