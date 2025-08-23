@@ -384,7 +384,7 @@ def create_regular_holiday_features(df: pd.DataFrame) -> pd.DataFrame:
             ((df_copy['연도'] == 2023) & (df_copy['월'] == 9) &
              (df_copy['요일'].isin(['Monday', 'Tuesday', 'Wednesday']))) |
             ((df_copy['연도'] == 2024) & (df_copy['월'] == 3)) |
-            ((df_copy['영업일자'] >= '2023-05-01') &
+            ((df_copy['영업일자'] >= '2024-05-01') &
              (df_copy['요일'].isin(['Monday', 'Tuesday', 'Wednesday', 'Thursday'])))
         )
     )
@@ -407,7 +407,6 @@ def create_regular_holiday_features(df: pd.DataFrame) -> pd.DataFrame:
 # =====================
 # Feature Utils
 # =====================
-나의 말:
 # build_enhanced_features 함수 수정
 def build_enhanced_features(dates: List[pd.Timestamp], holidays_set: set, store_names: Optional[List[str]] = None) -> pd.DataFrame:
     df = pd.DataFrame({"date": dates})
