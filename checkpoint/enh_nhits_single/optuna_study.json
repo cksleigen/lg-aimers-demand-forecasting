@@ -1,0 +1,14 @@
+{
+  "best_params": {
+    "hidden": 820,
+    "n_layers": 3,
+    "n_blocks": 5,
+    "dropout": 0.15411555142888372,
+    "base_lr": 0.0004118735140949077,
+    "weight_decay": 2.1648833854207637e-05,
+    "warmup_ratio": 0.07518872626248896,
+    "grad_clip": 0.7366454125299172,
+    "activation": "silu"
+  },
+  "best_val": 0.4682647315785289
+}
