@@ -396,7 +396,7 @@ def create_regular_holiday_features(df: pd.DataFrame) -> pd.DataFrame:
             ((df_copy['연도'] == 2023) & (df_copy['월'] == 9) &
              (df_copy['요일'].isin(['Monday', 'Tuesday', 'Wednesday']))) |
             ((df_copy['연도'] == 2024) & (df_copy['월'] == 3)) |
-            ((df_copy['영업일자'] >= '2023-05-01') &
+            ((df_copy['영업일자'] >= '2024-05-01') &
              (df_copy['요일'].isin(['Monday', 'Tuesday', 'Wednesday', 'Thursday'])))
         )
     )
