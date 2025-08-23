@@ -1765,7 +1765,6 @@ class TSMixer(nn.Module):
         prob_logits = self.prob_head(prob_feat)
 
         return value_pred, prob_logits
-
 class _TCNBlock(nn.Module):
     def __init__(self, c_in, c_out, k=3, d=1, p=0.1):
         super().__init__()
@@ -1777,30 +1776,69 @@ class _TCNBlock(nn.Module):
         self.norm = nn.LayerNorm(c_out)
 
     def forward(self, x):
-        y = self.net(x) + self.proj(x)      # 길이 동일 보장
+        y = self.net(x) + self.proj(x)
         return self.norm(y.transpose(1,2)).transpose(1,2)
 
 class TCNTiny(nn.Module):
-    def __init__(self, cfg, in_len, out_len, cal_dim, n_stores, n_categories, n_types, C=128, depth=4, drop=0.1):
+    def __init__(self, cfg, in_len, out_len, cal_dim, n_stores, n_categories, n_types,
+                 C=128, depth=4, drop=0.1, has_weekend_ratio: bool = False): # 🚨 (수정) has_weekend_ratio 인자 추가
         super().__init__()
         self.stem = nn.Conv1d(1, C, kernel_size=3, padding=1)
         self.blocks = nn.ModuleList([_TCNBlock(C, C, k=3, d=2**i, p=drop) for i in range(depth)])
         self.head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(C, out_len))
-        self.store_emb = nn.Embedding(n_stores,64); self.cat_emb = nn.Embedding(n_categories,32); self.type_emb = nn.Embedding(n_types,16)
+        
+        self.store_emb = nn.Embedding(n_stores,64)
+        self.cat_emb = nn.Embedding(n_categories,32)
+        self.type_emb = nn.Embedding(n_types,16)
         self.cal_proj = nn.Linear(cal_dim,128)
-        self.meta_head = nn.Sequential(nn.Linear(64+32+16+128, 256), nn.ReLU(), nn.Dropout(0.1), nn.Linear(256, out_len))
-        self.prob_head = nn.Sequential(nn.Linear(64+32+16+128+1, 256), nn.ReLU(), nn.Dropout(0.1), nn.Linear(256, out_len))
-    def forward(self, x, past_cal, fut_cal, store_idx, cat_idx, type_idx, **kwargs):
+        
+        # 🚨 (추가) weekend_ratio를 위한 MLP를 조건부로 생성
+        self.has_weekend_ratio = has_weekend_ratio
+        meta_dim = 64 + 32 + 16 + 128
+        if self.has_weekend_ratio:
+            self.weekend_ratio_mlp = nn.Sequential(
+                nn.Linear(1, 32), 
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+            meta_dim += 32
+        
+        # 🚨 (수정) meta_head와 prob_head의 입력 차원을 동적으로 조정
+        self.meta_head = nn.Sequential(
+            nn.Linear(meta_dim, 256), 
+            nn.ReLU(), 
+            nn.Dropout(0.1), 
+            nn.Linear(256, out_len)
+        )
+        self.prob_head = nn.Sequential(
+            nn.Linear(meta_dim + 1, 256), 
+            nn.ReLU(), 
+            nn.Dropout(0.1), 
+            nn.Linear(256, out_len)
+        )
+        
+    def forward(self, x, past_cal, fut_cal, store_idx, cat_idx, type_idx, weekend_ratio=None, **kwargs): # 🚨 (수정) weekend_ratio 인자 추가
         z = self.stem(x.unsqueeze(1))
         for blk in self.blocks: z = blk(z)
         seq_out = self.head(z)
-        store = self.store_emb(store_idx); cat = self.cat_emb(cat_idx); typ = self.type_emb(type_idx)
-        cal_all = torch.cat([past_cal, fut_cal], dim=1).mean(dim=1); cal = self.cal_proj(cal_all)
-        meta = torch.cat([store,cat,typ,cal], dim=-1)
+        
+        store = self.store_emb(store_idx)
+        cat = self.cat_emb(cat_idx)
+        typ = self.type_emb(type_idx)
+        cal_all = torch.cat([past_cal, fut_cal], dim=1).mean(dim=1)
+        cal = self.cal_proj(cal_all)
+        
+        # 🚨 (추가) weekend_ratio 처리 로직을 조건부로 실행
+        if self.has_weekend_ratio and weekend_ratio is not None:
+            weekend_ratio_emb = self.weekend_ratio_mlp(weekend_ratio.unsqueeze(1))
+            meta = torch.cat([store, cat, typ, cal, weekend_ratio_emb], dim=-1)
+        else:
+            meta = torch.cat([store, cat, typ, cal], dim=-1)
+            
         value_pred  = seq_out + self.meta_head(meta)
         prob_logits = self.prob_head(torch.cat([meta, x.mean(dim=1, keepdim=True)], dim=-1))
         return value_pred, prob_logits
-    
+
 
 # =====================
 # Loss / EMA (기존과 동일)
@@ -2531,7 +2569,9 @@ def build_model_by_name(name: str, cfg: EnhancedNHiTSConfig, ds: EnhancedNHiTSDa
         C = trial.suggest_categorical("tcn_C", [96,128,160]) if trial else 128
         depth = trial.suggest_categorical("tcn_depth", [3,4,5]) if trial else 4
         drop = trial.suggest_float("tcn_drop", 0.05, 0.25) if trial else 0.1
-        return TCNTiny(cfg, cfg.in_len, cfg.out_len, ds.cal_feats.shape[1], ds.n_stores, ds.n_categories, ds.n_types, C=C, depth=depth, drop=drop)
+        return TCNTiny(cfg, cfg.in_len, cfg.out_len, ds.cal_feats.shape[1],
+                   ds.n_stores, ds.n_categories, ds.n_types,
+                   C=C, depth=depth, drop=drop, has_weekend_ratio=has_weekend_ratio)
     
     raise ValueError(f"Unknown model name: {name}")
 
