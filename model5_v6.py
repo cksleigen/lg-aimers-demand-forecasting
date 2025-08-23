@@ -2237,8 +2237,7 @@ def cap_floor_itemwise(final_submit: pd.DataFrame, train_df: pd.DataFrame, cfg) 
         final_submit[col] = np.clip(final_submit[col].to_numpy(), floor_stat, cap)
     return final_submit
 
-
-"""### 메인 실행"""
+"""### 메인 실행 (H-wise 제거, 전역 가중치만)"""
 if __name__ == "__main__":
     cfg = EnhancedNHiTSConfig()
     if cfg.store_weights is None: cfg.store_weights = DEFAULT_STORE_WEIGHTS
@@ -2271,7 +2270,7 @@ if __name__ == "__main__":
             with open("./data/optuna_best_params.json", "w", encoding="utf-8") as f:
                 json.dump(best_params_all, f, ensure_ascii=False, indent=2)
 
-    # 🚨 수동 주입: Optuna 결과가 없으면 아래 값 사용
+    # 🚨 수동 주입: Optuna 결과가 없으면 아래 값 사용 (MLinear)
     if ("MLinear" not in best_params_all) or (best_params_all["MLinear"] is None):
         best_params_all["MLinear"] = {
             "base_lr": 0.0005377,
@@ -2289,7 +2288,6 @@ if __name__ == "__main__":
     model_names = ["TCN", "MLinear", "TimesNet", "GRU", "N-HiTS", "PatchTST", "TSMixer"]
     trained_models: Dict[str, nn.Module] = {}
     avg_val_losses: Dict[str, float] = {}
-    hwise_weights: Dict[str, list] = {m: [] for m in model_names}  # 모델별 fold H-wise 저장
 
     for name in model_names:
         checkpoint_path = os.path.join(cfg.checkpoint_dir, f"{name}_best_fold.pth")
@@ -2319,7 +2317,8 @@ if __name__ == "__main__":
         )
         init_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
         del base_model
-        gc.collect(); torch.cuda.empty_cache()
+        gc.collect(); 
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         fold_vals = []
         best_fold = None; best_fold_state = None
@@ -2343,25 +2342,20 @@ if __name__ == "__main__":
             )
             fold_vals.append(float(val_loss))
 
-            # ✅ fold별 horizon 가중치 계산 & 저장
-            try:
-                w_h = eval_hwise(trainer, val_loader)  # shape [H]
-                hwise_weights[name].append(w_h)
-            except Exception as e:
-                print(f"[WARN] eval_hwise 실패({name}-F{fold_i}): {e}")
-
             if (best_fold is None) or (val_loss < fold_vals[best_fold]):
                 best_fold = fold_i - 1
                 best_fold_state = {k: v.detach().cpu().clone() for k, v in model_f.state_dict().items()}
 
             del trainer, train_loader, val_loader, model_f
-            gc.collect(); torch.cuda.empty_cache()
+            gc.collect(); 
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         # 모델별 fold 평균 검증
         avg_val = float(np.mean(fold_vals)) if len(fold_vals) > 0 else float('inf')
         avg_val_losses[name] = avg_val
         print(f"[VAL(avg over folds)] {name}={avg_val:.5f}")
 
+        # 베스트 폴드 모델을 보관 + 저장
         final_model = build_final_model_with_best(
             name, cfg_for_model, ds, best_params_all.get(name) if (cfg.USE_OPTUNA or name == "MLinear") else None
         )
@@ -2373,21 +2367,11 @@ if __name__ == "__main__":
             torch.save(best_fold_state, checkpoint_path)
             print(f"💾 {name} 베스트 폴드 체크포인트 저장: {checkpoint_path}")
 
-    # ===== (모든 모델 학습 완료 후) H-wise/전역 가중치 집계 =====
-    final_hwise: Dict[str, np.ndarray] = {}
-    for m in model_names:
-        if len(hwise_weights.get(m, [])) > 0:
-            arr = np.stack(hwise_weights[m], axis=0)   # [F,H]
-            final_hwise[m] = arr.mean(axis=0)          # [H]
-        else:
-            final_hwise[m] = np.ones(cfg.out_len, dtype=np.float64) / float(cfg.out_len)
-
+    # ===== 전역 가중치 계산 (H-wise 없애고 전역만) =====
     vals_in_order = [avg_val_losses.get(n, np.nan) for n in model_names]
-    w = invloss_weights(vals_in_order)
-    weights = dict(zip(model_names, w))
-    print("[Ensemble Weights] " + "  ".join([f"{k}={weights[k]:.3f}" for k in model_names]))
-    for k in model_names:
-        print(f"[H-wise] {k}: {np.array2string(final_hwise[k], precision=3)}")
+    weights_arr = np.array(invloss_weights(vals_in_order), dtype=np.float64)  # 낮을수록 가중 ↑
+    weights = dict(zip(model_names, weights_arr))
+    print("[Ensemble Weights] " + "  ".join([f"{k}={weights.get(k,0.0):.3f}" for k in model_names]))
 
     # ===== 추론 & 제출 =====
     print("🔮 앙상블 예측...")
@@ -2408,15 +2392,18 @@ if __name__ == "__main__":
                 print(f"  ⚠️ 파일 로드 실패: {e}")
                 continue
 
-            df_preds = {}
+            df_preds: Dict[str, pd.DataFrame] = {}
             for name in model_names:
+                if name not in trained_models: 
+                    continue
                 group2idx = ds.group2idx if name == "MLinear" else None
                 df = predict_one_file_generic(
                     cfg, trained_models[name], tdf, train_df,
                     ds.store2idx, ds.cat2idx, ds.type2idx, group2idx
                 )
-                if df.empty:
+                if df is None or df.empty:
                     print(f"  ⚠️ {name} 예측이 비어 있습니다. 이 모델은 스킵합니다.")
+                    continue
                 df_preds[name] = df
 
             non_empty = [df for df in df_preds.values() if df is not None and not df.empty]
@@ -2424,19 +2411,28 @@ if __name__ == "__main__":
                 print(f"  ⚠️ {test_file} 유효 예측이 없어 스킵합니다.")
                 continue
 
+            # 아이템 정렬 통일
             items = list(non_empty[0].columns)
             for k in df_preds:
-                if df_preds[k] is not None and not df_preds[k].empty:
+                if k in df_preds:
                     df_preds[k] = df_preds[k].reindex(columns=items).fillna(0.0)
 
-            # === H-wise + 전역 가중 앙상블 ===
-            mix = np.zeros_like(non_empty[0].values, dtype=np.float64)   # [H, I]
-            for name in model_names:
-                df = df_preds.get(name, None)
-                if df is None or df.empty:
-                    continue
-                W_h = final_hwise.get(name, np.ones(cfg.out_len)/cfg.out_len).reshape(-1, 1)  # [H,1]
-                mix += weights[name] * (df.values * W_h.reshape(-1, 1))
+            # ✅ 전역 가중치만 사용한 가중 평균
+            models_available = [n for n in model_names if n in df_preds and df_preds[n] is not None and not df_preds[n].empty]
+            if len(models_available) == 0:
+                print("  ⚠️ 사용 가능한 모델 예측이 없습니다. 스킵")
+                continue
+
+            w = np.array([weights.get(n, 0.0) for n in models_available], dtype=np.float64)
+            w_sum = w.sum()
+            if w_sum <= 0:
+                w = np.ones(len(models_available), dtype=np.float64) / len(models_available)
+            else:
+                w = w / w_sum
+
+            mix = np.zeros_like(df_preds[models_available[0]].values, dtype=np.float64)
+            for i, n in enumerate(models_available):
+                mix += w[i] * df_preds[n].values
             mix = np.clip(mix, 0, None)
 
             submit_block = pd.DataFrame(
@@ -2444,7 +2440,6 @@ if __name__ == "__main__":
                 index=[f"D+{i}" for i in range(1, cfg.out_len + 1)],
                 columns=items
             )
-            
             submit_block.index = [f"TEST_{test_idx:02d}+{k}일" for k in range(1, cfg.out_len + 1)]
             submit_block = smooth_horizon_block(submit_block)
             all_preds.append(submit_block)
@@ -2456,13 +2451,18 @@ if __name__ == "__main__":
         final_submit.reset_index(inplace=True)
         final_submit.rename(columns={"index": "영업일자"}, inplace=True)
 
+        # 템플릿 컬럼 순서에 맞추기
         final_submit = final_submit.reindex(columns=sub_template.columns, fill_value=0)
 
+        # (선택) 최근 분포 기반 상한/하한 보정
         final_submit = cap_floor_itemwise(final_submit, train_df, cfg)
+
+        # 정수 반올림/클리핑
         num_cols = [c for c in final_submit.columns if c != cfg.date_col]
         final_submit[num_cols] = np.rint(
             np.clip(final_submit[num_cols].values, a_min=0, a_max=None)
         ).astype(int)
+
         os.makedirs(os.path.dirname(cfg.out_submission_csv), exist_ok=True)
         final_submit.to_csv(cfg.out_submission_csv, index=False, encoding="utf-8-sig")
         print(f"✅ 앙상블 완료! → {cfg.out_submission_csv}")
