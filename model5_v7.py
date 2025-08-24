@@ -1,19 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-Enhanced N-HiTS + Improved PatchTST + Improved TimesNet + GRU + MLinear (5-Model Ensemble)
-+ Optional Optuna Tuning + Multi-fold CV + Safe AMP + Memory-safe EMA
-
-주요 변경:
-- DLinear → MLinear로 교체
-- 그룹별 선형 변환 + 메타 피처 통합
-- Hurdle 모델 지원
-"""
 from __future__ import annotations
 
 import os, gc, glob, json, math, random, warnings
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-
 
 import numpy as np
 import pandas as pd
@@ -2569,9 +2559,7 @@ def build_model_by_name(name: str, cfg: EnhancedNHiTSConfig, ds: EnhancedNHiTSDa
         C = trial.suggest_categorical("tcn_C", [96,128,160]) if trial else 128
         depth = trial.suggest_categorical("tcn_depth", [3,4,5]) if trial else 4
         drop = trial.suggest_float("tcn_drop", 0.05, 0.25) if trial else 0.1
-        return TCNTiny(cfg, cfg.in_len, cfg.out_len, ds.cal_feats.shape[1],
-                   ds.n_stores, ds.n_categories, ds.n_types,
-                   C=C, depth=depth, drop=drop, has_weekend_ratio=has_weekend_ratio)
+        return TCNTiny(cfg, cfg.in_len, cfg.out_len, ds.cal_feats.shape[1], ds.n_stores, ds.n_categories, ds.n_types, has_weekend_ratio=has_weekend_ratio, C=C, depth=depth, drop=drop) 
     
     raise ValueError(f"Unknown model name: {name}")
 
@@ -2686,12 +2674,78 @@ def cap_floor_itemwise(final_submit: pd.DataFrame, train_df: pd.DataFrame, cfg) 
         final_submit[col] = np.clip(final_submit[col].to_numpy(), floor_stat, cap)
     return final_submit
 
-def _cfg_for_mlinear_ckpt(base_cfg):
-    return EnhancedNHiTSConfig(**{
-        **base_cfg.__dict__,
-        "mlin_hidden_dim": 512,        # ← ckpt 와 동일
-        "mlin_use_layer_norm": False,  # ← ckpt 에 LayerNorm 없음
-    })
+
+# === helper: 모델별 cfg를 best_params_all에 맞춰 일관되게 생성 ===
+def cfg_for_model(name: str, base_cfg, best_params_all: dict):
+    tmp = dict(base_cfg.__dict__)
+    bp = best_params_all.get(name, {}) or {}
+
+    if name == "MLinear":
+        # ckpt 구조/옵튜나 반영
+        tmp.update({
+            "mlin_hidden_dim": bp.get("ml_hidden_dim", 256),     # ← 당신이 지정한 값 사용
+            "mlin_dropout": bp.get("ml_dropout", base_cfg.mlin_dropout),
+            "mlin_use_residual": bp.get("ml_residual", base_cfg.mlin_use_residual),
+            "mlin_use_layer_norm": bp.get("ml_layer_norm", False),  # ckpt와 일치
+            "grad_clip": bp.get("grad_clip", base_cfg.grad_clip),
+            "earlystop_patience_ratio": bp.get("pat_ratio", base_cfg.earlystop_patience_ratio),
+        })
+
+    elif name == "GRU":
+        tmp.update({
+            "gru_hidden": bp.get("gru_hidden", base_cfg.gru_hidden),
+            "gru_layers": bp.get("gru_layers", base_cfg.gru_layers),
+            "gru_dropout": bp.get("gru_dropout", base_cfg.gru_dropout),
+            "gru_bidirectional": bp.get("gru_bidi", base_cfg.gru_bidirectional),
+            "grad_clip": bp.get("grad_clip", base_cfg.grad_clip),
+            "earlystop_patience_ratio": bp.get("pat_ratio", base_cfg.earlystop_patience_ratio),
+        })
+
+    elif name == "PatchTST":
+        tmp.update({
+            "ptst_nhead": bp.get("pt_nhead", base_cfg.ptst_nhead),
+            "ptst_d_model": bp.get("pt_d_model", base_cfg.ptst_d_model),
+            "ptst_num_layers": bp.get("pt_nlayers", base_cfg.ptst_num_layers),
+            "ptst_patch_len": bp.get("pt_patch", base_cfg.ptst_patch_len),
+            "ptst_stride": bp.get("pt_stride", base_cfg.ptst_stride),
+            "ptst_dropout": bp.get("pt_dropout", base_cfg.ptst_dropout),
+            "ptst_ff_mult": bp.get("ptst_ff_mult", base_cfg.ptst_ff_mult),
+            "grad_clip": bp.get("grad_clip", base_cfg.grad_clip),
+            "earlystop_patience_ratio": bp.get("pat_ratio", base_cfg.earlystop_patience_ratio),
+        })
+
+    elif name == "TimesNet":
+        tmp.update({
+            "tnet_channels": bp.get("tn_channels", base_cfg.tnet_channels),
+            "tnet_blocks":  bp.get("tn_blocks",  base_cfg.tnet_blocks),  # ★ 블록 수 일치!
+            "tnet_dropout": bp.get("tn_dropout", base_cfg.tnet_dropout),
+            "grad_clip": bp.get("grad_clip", base_cfg.grad_clip),
+            "earlystop_patience_ratio": bp.get("pat_ratio", base_cfg.earlystop_patience_ratio),
+        })
+
+    elif name == "TSMixer":
+        tmp.update({
+            "tsm_d_model": bp.get("tm_d_model", base_cfg.tsm_d_model),
+            "tsm_num_layers": bp.get("tm_n_layers", base_cfg.tsm_num_layers),
+            "tsm_dropout": bp.get("tm_dropout", base_cfg.tsm_dropout),
+            "tsm_patch_len": bp.get("tm_patch", base_cfg.tsm_patch_len),
+            "grad_clip": bp.get("grad_clip", base_cfg.grad_clip),
+            "earlystop_patience_ratio": bp.get("pat_ratio", base_cfg.earlystop_patience_ratio),
+        })
+
+    # TCN / N-HiTS도 옵튜나를 쓰면 동일 패턴으로 추가
+
+    return EnhancedNHiTSConfig(**tmp)
+
+
+# === helper: 러닝 하이퍼(스케줄)도 모델별로 가져오기 ===
+def lr_sched_for_model(name: str, base_cfg, best_params_all: dict):
+    bp = best_params_all.get(name, {}) or {}
+    base_lr = bp.get("base_lr", base_cfg.BASE_LR_FULL)
+    max_lr  = bp.get("max_lr",  base_cfg.MAX_LR_FULL)
+    weight_decay = bp.get("weight_decay", base_cfg.WD_FULL)
+    return base_lr, max_lr, weight_decay
+    
 
 """### 메인 실행 (v7, H-wise OFF)"""
 if __name__ == "__main__":
@@ -2718,55 +2772,95 @@ if __name__ == "__main__":
                 train_df[col] = pd.to_numeric(train_df[col], errors="coerce").fillna(0.0)
             else:
                 train_df[col] = train_df[col].fillna("")
+
     # 아티팩트/체크포인트 폴더
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     artifacts_dir = getattr(cfg, "artifacts_dir", "./artifacts")
     os.makedirs(artifacts_dir, exist_ok=True)
 
-    # γ 보정 로딩
+    # γ 보정 로딩(이후 OOF 새로 학습되면 최신값으로 덮어씀)
     gamma = None
+    preload_stacker = None
     stacker_path = os.path.join(artifacts_dir, "oof_stacker.json")
     if os.path.exists(stacker_path):
         try:
-            stk = OOFStacker.load(stacker_path)
-            gamma = getattr(stk, "gamma", None)
-            print(f"[p-Calibration] gamma={gamma}")
+            preload_stacker = OOFStacker.load(stacker_path)
+            gamma = getattr(preload_stacker, "gamma", None)
+            print(f"[p-Calibration] loaded gamma from disk: {gamma}")
         except Exception as e:
             print(f"[p-Calibration] 스태커 로드 실패: {e}")
 
-    # ===== (옵션) Optuna (MLinear만) =====
-    best_params_all = {}
-    if cfg.USE_OPTUNA and HAS_OPTUNA:
-        print(f"[Optuna] 1st-fold({cfg.cv_fold_end_dates[0]})로 빠른 튜닝 실행")
-        tune_mask_val = make_val_mask_by_week(ds, cfg.cv_fold_end_dates[0])
-        study, best_params = run_optuna_for_model("MLinear", cfg, ds, tune_mask_val)
-        best_params_all["MLinear"] = best_params
-        with open(os.path.join(artifacts_dir, "optuna_best_params.json"), "w", encoding="utf-8") as f:
-            json.dump(best_params_all, f, ensure_ascii=False, indent=2)
-
-    # Optuna 미사용/실패 시 기본 주입
-    if ("MLinear" not in best_params_all) or (best_params_all["MLinear"] is None):
-        best_params_all["MLinear"] = {
-            "base_lr": 0.0005377,
-            "max_lr": 0.001667,
-            "weight_decay": 4.5283e-05,
-            "grad_clip": 0.3176,
-            "pat_ratio": 0.1633,
-            "ml_hidden_dim": 512,
-            "ml_dropout": 0.2586,
+    # ===== (고정) Optuna 베스트 파라미터 사전 =====
+    #   ※ 모든 모델 반영. 필요시 값 업데이트 가능.
+    best_params_all = {
+        "GRU": {
+            "base_lr": 0.002608813765946099,
+            "max_lr": 0.005913299155084703,
+            "weight_decay": 8.902526583565278e-06,
+            "grad_clip": 0.8693667302369661,
+            "pat_ratio": 0.293401204144316,
+            "gru_hidden": 192,
+            "gru_layers": 2,
+            "gru_dropout": 0.009318090388599045,
+            "gru_bidi": True
+        },
+        "MLinear": {
+            "base_lr": 0.0006754281022613254,
+            "max_lr": 0.0012182792933220078,
+            "weight_decay": 0.0004068815511748987,
+            "grad_clip": 0.62966422280452,
+            "pat_ratio": 0.3109322615678773,
+            "ml_hidden_dim": 256,
+            "ml_dropout": 0.2058698997911769,
             "ml_residual": True,
-            "ml_layer_norm": False,
+            "ml_layer_norm": False
+        },
+        "PatchTST": {
+            "base_lr": 0.0015571380384964322,
+            "max_lr": 0.0009541370077515215,
+            "weight_decay": 0.0007223995456735,
+            "grad_clip": 0.9395129291258619,
+            "pat_ratio": 0.3369444523980561,
+            "pt_nhead": 8,
+            "pt_d_model": 192,
+            "pt_nlayers": 2,
+            "pt_patch": 4,
+            "pt_stride": 1,
+            "pt_dropout": 0.07026875869626188,
+            "ptst_ff_mult": 1.608051349717431
+        },
+        "TimesNet": {
+            "base_lr": 0.0006070080910610924,
+            "max_lr": 0.005555341295975858,
+            "weight_decay": 1.438243881908083e-06,
+            "grad_clip": 0.7390747147224607,
+            "pat_ratio": 0.2185057088051843,
+            "tn_channels": 128,
+            "tn_blocks": 2,
+            "tn_dropout": 0.2699643825043025
+        },
+        "TSMixer": {
+            "base_lr": 0.0008164657149764272,
+            "max_lr": 0.0019464979728682033,
+            "weight_decay": 4.569226394816766e-05,
+            "grad_clip": 0.5500900003929292,
+            "pat_ratio": 0.32624960405771475,
+            "tm_d_model": 192,
+            "tm_n_layers": 3,
+            "tm_dropout": 0.2780721839340433,
+            "tm_patch": 3
         }
+    }
+    # (Optuna 실시간 사용 시) cfg.USE_OPTUNA True로 두고 각 모델별 run_optuna_for_model을 호출하면 best_params_all 갱신
 
     # ===== 1단계: OOF 생성(모든 모델×폴드) → 전역가중/보정 학습 =====
     model_names = ["TCN", "MLinear", "TimesNet", "GRU", "N-HiTS", "PatchTST", "TSMixer"]
 
-    # 스태커 설정: H-wise 관련 옵션 없이(p/바이어스만 쓸 수 있게)
     stack_cfg = StackerConfig(
         use_stacker=True,
-        use_hwise_prior=False,        # ★ H-wise 완전 OFF
-        use_p_calib=True,             # p-보정 사용
-        use_recent_bias=True          # 최근 바이어스 보정 사용
+        use_hwise_prior=False,   # ★ H-wise 완전 OFF
+        use_p_calib=True,        # p-보정 사용
+        use_recent_bias=True     # 최근 바이어스 보정 사용
     )
 
     OOF_y_true = []                                   # list of [N_fold, H]
@@ -2774,7 +2868,6 @@ if __name__ == "__main__":
     OOF_prob_mean = []                                # list of [N_fold, H]
     OOF_item_names = []                               # 아이템 이름 정렬
 
-    # 재학습 단축: OOF의 베스트 폴드 스냅샷 재사용해 최종 모델 구성
     REUSE_OOF_BEST = True
     saved_states = {m: [] for m in model_names}
     saved_val_losses = {m: [] for m in model_names}
@@ -2787,42 +2880,27 @@ if __name__ == "__main__":
         item_idx_fold = None
 
         for mname in model_names:
-            # 모델별 cfg 스위칭(MLinear만 Optuna 주입)
-            cfg_for_model = cfg
-            if mname == "MLinear":
-                bp = best_params_all["MLinear"]
-                cfg_for_model = EnhancedNHiTSConfig(**{
-                    **cfg.__dict__,
-                    "mlin_hidden_dim": bp.get("ml_hidden_dim", cfg.mlin_hidden_dim),
-                    "mlin_dropout": bp.get("ml_dropout", cfg.mlin_dropout),
-                    "mlin_use_residual": bp.get("ml_residual", cfg.mlin_use_residual),
-                    "mlin_use_layer_norm": bp.get("ml_layer_norm", cfg.mlin_use_layer_norm),
-                    "grad_clip": bp.get("grad_clip", cfg.grad_clip),
-                    "earlystop_patience_ratio": bp.get("pat_ratio", cfg.earlystop_patience_ratio),
-                })
-                base_lr = bp.get("base_lr", cfg.BASE_LR_FULL)
-                max_lr  = bp.get("max_lr",  cfg.MAX_LR_FULL)
-                weight_decay = bp.get("weight_decay", cfg.WD_FULL)
-            else:
-                base_lr, max_lr, weight_decay = cfg.BASE_LR_FULL, cfg.MAX_LR_FULL, cfg.WD_FULL
-
-            model = build_model_by_name(mname, cfg_for_model, ds)
+            # --- per-model Config/하이퍼 주입(Optuna 결과 반영) ---
+            cfg_for_model_m = cfg_for_model(mname, cfg, best_params_all)
+            base_lr, max_lr, weight_decay = lr_sched_for_model(mname, cfg, best_params_all)
+        
+            model = build_model_by_name(mname, cfg_for_model_m, ds)
             trainer = GenericTrainer(
-                cfg_for_model, ds, model,
-                epochs=cfg_for_model.EPOCHS_FULL, batch_size=cfg_for_model.BATCH_FULL,
+                cfg_for_model_m, ds, model,
+                epochs=cfg_for_model_m.EPOCHS_FULL, batch_size=cfg_for_model_m.BATCH_FULL,
                 base_lr=base_lr, max_lr=max_lr, weight_decay=weight_decay
             )
             train_loader, val_loader = trainer.make_loaders_from_mask(mask_val)
-
+        
             # OOF 학습
             model_f, val_loss = trainer.train_with_loaders(
                 train_loader, val_loader, model_name=f"{mname}-OOF-F{f_idx}"
             )
-
+        
             # 스냅샷/val 저장
             saved_states[mname].append({k: v.cpu().clone() for k, v in model_f.state_dict().items()})
             saved_val_losses[mname].append(float(val_loss))
-
+        
             # OOF 예측 수집
             yt, yh, pp, idxs = trainer.predict_on_loader(val_loader)
             if y_true_fold is None:
@@ -2830,11 +2908,12 @@ if __name__ == "__main__":
                 item_idx_fold = idxs
             OOF_yhat_by_model[mname].append(yh)
             prob_accum.append(pp)
-
+        
             # 메모리 정리
             del trainer, train_loader, val_loader, model_f, model
             gc.collect()
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # fold-level prob 평균
         prob_mean = np.mean(np.stack(prob_accum, axis=0), axis=0)
@@ -2849,18 +2928,20 @@ if __name__ == "__main__":
                        for m in model_names], axis=1)                             # [N_tot, M, H]
     p_oof_mean = np.concatenate(OOF_prob_mean, axis=0)                            # [N_tot, H]
 
-    # 스태커(전역가중/보정 정보) 학습 & 저장
+    # 스태커(전역가중/보정 정보) 학습 & 저장 -> 최신 gamma로 갱신
     stacker = OOFStacker(stack_cfg).fit(
         yh_oof, yt_oof, model_names=model_names,
         p_oof=p_oof_mean, item_names_oof=OOF_item_names
     )
-    stacker_path = os.path.join(artifacts_dir, "oof_stacker.json")
+    gamma = getattr(stacker, "gamma", None)
+    bias_by_item = getattr(stacker, "bias_by_item", None)
     stacker.save(stacker_path)
-    print(f"[Stacker] saved to {stacker_path}")
+    print(f"[Ensemble] Using gamma={gamma} | recent_bias={'ON' if (bias_by_item and stack_cfg.use_recent_bias) else 'OFF'}")
 
     # ===== 2단계: 최종 모델 구성 (OOF 베스트 스냅샷 재사용) =====
     trained_models, avg_val_losses = {}, {}
     print("\n✅ REUSE_OOF_BEST=True: OOF 베스트 폴드 스냅샷으로 최종 모델 구성")
+    
     for name in model_names:
         if len(saved_states[name]) == 0:
             print(f"[WARN] {name}: 저장된 OOF 스냅샷 없음, 0번 사용")
@@ -2868,23 +2949,19 @@ if __name__ == "__main__":
         else:
             best_idx = int(np.argmin(saved_val_losses[name]))
         best_state = saved_states[name][best_idx]
-
-        # ⬇️ MLinear만 ckpt config 적용
-        if name == "MLinear":
-            cfg_mlin = _cfg_for_mlinear_ckpt(cfg)
-            final_model = build_model_by_name("MLinear", cfg_mlin, ds)
-        else:
-            final_model = build_model_by_name(name, cfg, ds)
-
+    
+        # ✅ 모델별 Optuna/수동 하이퍼 반영된 동일 CFG로 인스턴스 생성
+        cfg_m = cfg_for_model(name, cfg, best_params_all)
+        final_model = build_model_by_name(name, cfg_m, ds)
         final_model.load_state_dict(best_state, strict=True)
         trained_models[name] = final_model.to(cfg.device)
-
+    
         avg_val_losses[name] = float(np.mean(saved_val_losses[name])) if len(saved_val_losses[name]) else float('inf')
-
+    
         ckpt = os.path.join(cfg.checkpoint_dir, f"{name}_best_from_oof.pth")
         torch.save(best_state, ckpt)
         print(f"  💾 {name}: OOF 베스트 스냅샷 저장 → {ckpt}")
-
+        
     # ===== 3단계: 전역 가중치 집계(역손실, H-wise 없음) =====
     def _norm_inverse_losses(loss_list, eps: float = 1e-6, winsor: float = 0.1):
         a = np.array(loss_list, dtype=np.float64)
@@ -2910,6 +2987,9 @@ if __name__ == "__main__":
     if not os.path.exists(cfg.submission_template_csv):
         raise FileNotFoundError(f"제출 템플릿 파일을 찾을 수 없습니다: {cfg.submission_template_csv}")
     sub_template = pd.read_csv(cfg.submission_template_csv)
+
+    # 상태 로그 (gamma/최근바이어스)
+    print(f"[Ensemble] Using gamma={gamma}  | recent_bias={'ON' if (getattr(stacker,'bias_by_item',None) and stack_cfg.use_recent_bias) else 'OFF'}")
 
     all_preds = []
     if len(test_files) == 0:
